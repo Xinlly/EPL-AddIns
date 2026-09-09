@@ -58,6 +58,14 @@ dotnet build EPL-AddIns.slnx
 - 修改代码只动与需求直接相关的行，禁止整文件重写、顺手改格式/注释。
 - EPLAN 实际加载、注册、运行测试由用户在 Windows 的 EPLAN 中完成；助手无法启动 EPLAN，不得声称"已验证运行"。
 
+### Git 提交与推送身份
+
+- **默认规则：助手（Dora）代做的提交，作者/提交者一律署名 `Dora <dora@noreply.local>`**（不归属任何 GitHub 账号；注意不要用 `xxx@users.noreply.github.com` 格式，那会归属到真实同名账号）。
+- 仅当用户明确说明"这是我的提交"时，才使用用户身份 `Xinlly <Xinlly@outlook.com>`。
+- 实现方式：不改仓库 git config；提交时用当次环境变量 `GIT_AUTHOR_NAME/EMAIL`、`GIT_COMMITTER_NAME/EMAIL`，不影响用户在 VS 中的手动提交。
+- 推送认证始终使用 Xinlly 的 GitHub token（GitHub 记录的 pusher 是 Xinlly，作者是 Dora，两者独立）；WSL 侧推送走 `https_proxy=http://127.0.0.1:35353`，token 不写入 remote 配置。
+- 重写历史用 `--force-with-lease`；推送到显式 URL 时需写成 `--force-with-lease=main:<远端当前sha>`，否则 lease 校验找不到跟踪引用。
+
 ---
 
 ## Add-in 生命周期（IEplAddIn，官方文档核实）
