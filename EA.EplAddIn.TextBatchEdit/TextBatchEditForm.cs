@@ -23,9 +23,10 @@ public class TextBatchEditForm : Form
 
     private const int ColIndex = 0;
     private const int ColType = 1;
-    private const int ColTranslated = 2;
-    private const int ColSourceMirror = 3; // 独立"源语言"列，与项目语言区源语言列双向同步
-    private const int LangColStart = 4;
+    private const int ColMultilang = 2;   // "多语言"复选框（原"翻译"）
+    private const int ColNoAutoTrans = 3; // "不自动翻译"复选框（勾选=IsAutomaticallyTranslated=false）
+    private const int ColSourceMirror = 4; // 独立"源语言"列，与项目语言区源语言列双向同步
+    private const int LangColStart = 5;
 
     private bool _syncing; // 镜像列同步防递归
 
@@ -72,8 +73,11 @@ public class TextBatchEditForm : Form
         _grid.Columns[ColType].ReadOnly = true;
         _grid.Columns[ColType].SortMode = DataGridViewColumnSortMode.NotSortable;
 
-        _grid.Columns.Add(new DataGridViewCheckBoxColumn { Name = "translated", HeaderText = "翻译", Width = 52 });
-        _grid.Columns[ColTranslated].SortMode = DataGridViewColumnSortMode.NotSortable;
+        _grid.Columns.Add(new DataGridViewCheckBoxColumn { Name = "multilang", HeaderText = "多语言", Width = 60 });
+        _grid.Columns[ColMultilang].SortMode = DataGridViewColumnSortMode.NotSortable;
+
+        _grid.Columns.Add(new DataGridViewCheckBoxColumn { Name = "noAutoTrans", HeaderText = "不自动翻译", Width = 84 });
+        _grid.Columns[ColNoAutoTrans].SortMode = DataGridViewColumnSortMode.NotSortable;
 
         // 独立源语言列（最左语言列）
         _grid.Columns.Add("srcMirror", "源语言(" + LangHelper.Code(_sourceLang) + ")");
@@ -92,10 +96,11 @@ public class TextBatchEditForm : Form
             _langCol[lang] = colIdx;
         }
 
-        // 复选框切换 → 行可编辑状态 + 镜像列同步
+        // 复选框切换 → 行可编辑状态 + 镜像列同步（两种复选框都即时提交）
         _grid.CurrentCellDirtyStateChanged += (_, _) =>
         {
-            if (_grid.IsCurrentCellDirty && _grid.CurrentCell?.ColumnIndex == ColTranslated)
+            var col = _grid.CurrentCell?.ColumnIndex ?? -1;
+            if (_grid.IsCurrentCellDirty && (col == ColMultilang || col == ColNoAutoTrans))
             {
                 _grid.CommitEdit(DataGridViewDataErrorContexts.Commit);
             }
@@ -103,11 +108,17 @@ public class TextBatchEditForm : Form
         _grid.CellValueChanged += (_, e) =>
         {
             if (e.RowIndex < 0) { return; }
-            if (e.ColumnIndex == ColTranslated)
+            if (e.ColumnIndex == ColMultilang)
             {
-                var tr = Convert.ToBoolean(_grid[ColTranslated, e.RowIndex].Value ?? false);
+                var tr = Convert.ToBoolean(_grid[ColMultilang, e.RowIndex].Value ?? false);
                 SetRowEditable(e.RowIndex, tr);
-                AddInLogger.Debug("行" + (e.RowIndex + 1) + " 翻译复选框=" + tr);
+                AddInLogger.Debug("行" + (e.RowIndex + 1) + " 多语言复选框=" + tr);
+            }
+            else if (e.ColumnIndex == ColNoAutoTrans)
+            {
+                var noAuto = Convert.ToBoolean(_grid[ColNoAutoTrans, e.RowIndex].Value ?? false);
+                AddInLogger.Debug("行" + (e.RowIndex + 1) + " 不自动翻译复选框=" + noAuto
+                    + "（IsAutomaticallyTranslated=" + !noAuto + "）");
             }
             else if (!_syncing)
             {
@@ -176,8 +187,8 @@ public class TextBatchEditForm : Form
 
         var tip = new Label
         {
-            Text = "勾选\"翻译\"=已翻译多语言文本（各语言列可编辑）；不勾选=未翻译（仅左侧源语言列可编辑，写为语言无关串）。\n"
-                 + "支持框选后 Ctrl+C/X/V 块复制粘贴（Tab 分列、换行分行，可与 Excel 互贴），Delete 清除。",
+            Text = "勾选\"多语言\"=多语言文本（各语言列可编辑），不勾选=语言无关串（仅左侧源语言列可编辑）。\n"
+                 + "\"不自动翻译\"对应文本属性 Do not translate automatically，与是否多语言相互独立。支持框选 Ctrl+C/X/V 块粘贴（Tab 分列、换行分行，可与 Excel 互贴），Delete 清除。",
             Dock = DockStyle.Top,
             Height = 40,
             TextAlign = ContentAlignment.MiddleLeft,
@@ -215,6 +226,7 @@ public class TextBatchEditForm : Form
             var t = _texts[i];
             var typeName = t.GetType().Name;
             var isTranslated = true;
+            var noAutoTrans = false; // IsAutomaticallyTranslated=false
             var values = new Dictionary<ISOCode.Language, string>();
             string mirrorVal = string.Empty;
 
@@ -237,7 +249,9 @@ public class TextBatchEditForm : Form
                 AddInLogger.Debug("选中[" + i + "] 类型=" + typeName + " 页=" + pageName
                     + " DBID=" + Safe(() => t.DatabaseIdentifier.ToString())
                     + " 语言列表=[" + string.Join(",", langNames) + "]"
+                    + " IsAutomaticallyTranslated=" + Safe(() => t.IsAutomaticallyTranslated.ToString())
                     + " InternalString=" + Preview(c.InternalString));
+                noAutoTrans = !t.IsAutomaticallyTranslated;
 
                 if (langs.Count == 0 || hasUnknown)
                 {
@@ -271,7 +285,8 @@ public class TextBatchEditForm : Form
             var row = _grid.Rows[rowIdx];
             row.Cells[ColIndex].Value = (i + 1).ToString();
             row.Cells[ColType].Value = typeName;
-            row.Cells[ColTranslated].Value = isTranslated;
+            row.Cells[ColMultilang].Value = isTranslated;
+            row.Cells[ColNoAutoTrans].Value = noAutoTrans;
             row.Cells[ColSourceMirror].Value = mirrorVal;
             foreach (var lang in _projectLangs)
             {
@@ -315,7 +330,8 @@ public class TextBatchEditForm : Form
     private List<DataGridViewCell> EditableSelectedCells() =>
         _grid.SelectedCells.Cast<DataGridViewCell>()
             .Where(c => c.RowIndex >= 0 && !c.ReadOnly
-                && c.ColumnIndex != ColIndex && c.ColumnIndex != ColType && c.ColumnIndex != ColTranslated)
+                && c.ColumnIndex != ColIndex && c.ColumnIndex != ColType
+                && c.ColumnIndex != ColMultilang && c.ColumnIndex != ColNoAutoTrans)
             .ToList();
 
     private void CopySelection()
@@ -428,7 +444,9 @@ public class TextBatchEditForm : Form
                     continue;
                 }
 
-                var translated = Convert.ToBoolean(_grid[ColTranslated, i].Value ?? false);
+                var translated = Convert.ToBoolean(_grid[ColMultilang, i].Value ?? false);
+                var noAutoTrans = Convert.ToBoolean(_grid[ColNoAutoTrans, i].Value ?? false);
+                var wantAutoTrans = !noAutoTrans; // 勾选"不自动翻译" → IsAutomaticallyTranslated=false
                 var mirrorVal = _grid[ColSourceMirror, i].Value as string ?? string.Empty;
 
                 // 期望写入：语言 → 值
@@ -450,12 +468,18 @@ public class TextBatchEditForm : Form
                 }
 
                 var beforeInternal = Preview(t.Contents.InternalString);
+                var beforeAuto = t.IsAutomaticallyTranslated;
                 var mls = new MultiLangString();
                 foreach (var kv in expected) { mls.AddString(kv.Key, kv.Value); }
                 t.Contents = mls;
+                if (beforeAuto != wantAutoTrans)
+                {
+                    t.IsAutomaticallyTranslated = wantAutoTrans;
+                }
                 changedObjects++;
 
                 AddInLogger.Debug("写回 行" + (i + 1) + " " + mode
+                    + " 自动翻译 " + beforeAuto + "→" + wantAutoTrans + (beforeAuto != wantAutoTrans ? "(改)" : "")
                     + "\n    before internal=" + beforeInternal
                     + "\n    after : " + string.Join(" ", expected.Select(kv => LangHelper.Code(kv.Key) + "=" + Preview(kv.Value))));
             }
@@ -472,10 +496,19 @@ public class TextBatchEditForm : Form
             {
                 var t = _texts[i];
                 if (!t.IsValid) { continue; }
-                var translated = Convert.ToBoolean(_grid[ColTranslated, i].Value ?? false);
+                var translated = Convert.ToBoolean(_grid[ColMultilang, i].Value ?? false);
+                var wantAutoTrans = !Convert.ToBoolean(_grid[ColNoAutoTrans, i].Value ?? false);
                 var mirrorVal = _grid[ColSourceMirror, i].Value as string ?? string.Empty;
                 var c = t.Contents;
                 bool rowOk = true;
+
+                // 回读自动翻译标志
+                if (t.IsAutomaticallyTranslated != wantAutoTrans)
+                {
+                    rowOk = false;
+                    AddInLogger.Error("回读不一致 行" + (i + 1) + " IsAutomaticallyTranslated 期望=" + wantAutoTrans
+                        + " 实际=" + t.IsAutomaticallyTranslated);
+                }
 
                 if (translated)
                 {

@@ -192,6 +192,7 @@ new Decider().Decide(
     - 显示语言：`TRANSLATEGUI.DISPLAYED_LANGUAGES`（同样分号串，如 `zh_CN;en_US;`）
     - 短码↔枚举：`new ISOCode().SetString(code)` 后无参 `GetNumber()`；枚举→短码 `GetString(lang)`
   - **表格语言列结构**：独立"源语言"列置于最左，右侧依次为全部翻译语言（含源语言本身，按设置固定顺序）；源语言列与语言区里的源语言列双向同步值。未翻译行仅源语言列可编辑（语言无关串），语言区只读
+  - **"不自动翻译"标志**：`TextBase.IsAutomaticallyTranslated`（`bool { get; set; }`，DataModelu.dll），文档原文对应 UI 的 "Do not translate automatically"。**语义反相**：UI 勾选"不自动翻译"= 属性设 `false`。它与"多语言/语言无关串"是两个相互独立的属性，互不影响（另有 `LanguageMode`（`TextBase.TextLanguageMode` 枚举）+ `FixedLanguage` 控制单语言显示模式，本插件未用）
 
 ---
 
