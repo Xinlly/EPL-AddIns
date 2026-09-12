@@ -20,13 +20,19 @@ EPLAN Electric P8 2.9 **Add-in（编译型 DLL）** 集合（C#）。与 EPL-Scr
 ```
 EPL-AddIns/
 ├── EPL-AddIns.slnx              # Visual Studio 解决方案（XML 格式，多项目容器）
-├── EA.EplAddIn.Test/            # 第一个 Add-in：Hello World 骨架
+├── EA.EplAddIn.Test/            # 第一个 Add-in：Hello World 骨架 + 表格编辑演示
 │   ├── EA.EplAddIn.Test.csproj
 │   ├── Class1.cs                # IEplAddIn 实现：注册/生命周期/菜单/全局异常
 │   ├── AddInLogger.cs           # 文件日志（DEBUG/INFO/WARN/ERROR，按天一个文件）
 │   ├── HelloWorldAction.cs      # IEplAction 实现
 │   ├── TableEditorForm.cs       # WinForms 表格编辑窗口（DataGridView，界面演示）
 │   └── TableEditorAction.cs     # 打开表格窗口的 Action
+├── EA.EplAddIn.TextBatchEdit/   # 第二个 Add-in：批量修改选中文本的中英文
+│   ├── EA.EplAddIn.TextBatchEdit.csproj
+│   ├── TextBatchEditAddIn.cs    # IEplAddIn + 菜单
+│   ├── TextBatchEditAction.cs   # 取选择集筛 TextBase → 开窗 → 写回
+│   ├── TextBatchEditForm.cs     # 中英文表格（块复制粘贴/右键菜单）+ LockingStep 写回
+│   └── AddInLogger.cs           # 与 Test 同构（第三个插件时抽 Shared 项目）
 ├── references/                  # 本地引用程序集（不入库，见下）
 │   └── EplApi/*.dll             # 从 EPLAN 2.9 安装目录复制
 ├── AGENT.md
@@ -153,6 +159,32 @@ new Decider().Decide(
 
 `new Menu().AddMenuItem("菜单文本", "ActionName")` —— 2 参数重载，追加到"实用工具/工具"菜单末尾，在 `OnInitGui` 中调用。
 右键菜单需用 `ContextMenu` + `ContextMenuLocation`（先开 `USER.EnfMVC.ContextMenuSetting.ShowIdentifier` 查真实菜单 ID，禁止凭猜测写 ID）。
+
+### 选择集与文本对象（TextBatchEdit 已核实签名）
+
+- 取当前选择：`new Eplan.EplApi.HEServices.SelectionSet().Selection` → `StorableObject[]`（只在单个项目内有效；选中节点时只返回第一个元素）
+- 文本对象：自由文本 `Text`、路径文本 `PathText` 的共同基类是 `Eplan.EplApi.DataModel.Graphics.TextBase`；用 `.OfType<TextBase>()` 一次覆盖两类。**注意命名空间冲突**：该命名空间下还有 `Color` 类型，与 `System.Drawing.Color` 冲突时写完全限定名；同理 `Menu` 用 `Eplan.EplApi.Gui.Menu`
+- 多语言内容：`TextBase.Contents` 是 `Eplan.EplApi.Base.MultiLangString`（get/set 都有）
+  - **写回必须走 setter 整体赋回**：`var mls=new MultiLangString(); ...; text.Contents = mls;`。只对 getter 返回对象就地 `AddString/DeleteString` 不落库（实测回写不生效）
+  - 读：`GetString(ISOCode.Language.L_zh_CN)` / `L_en_US`；枚举名带 `L_` 前缀（`L_zh_CN`=100 简体中文，未设置该语言时的行为待实测，调用方 try/catch 兜底）
+  - 写：`AddString(lang, val)`；删：`DeleteString(lang)`
+  - 判断已有语言：`var list = new LanguageList(); contents.GetLanguageList(ref list);`，元素访问必须用 C++/CLI 访问器 **`list.get_Language(i)`**（C# 写 `list.Language[i]` 报 CS1546）
+  - **翻译 vs 未翻译**：未翻译文本是"语言无关串"（语言码 `L___`=0，所有语言显示相同）；语言列表为空或含 `L___` 即为未翻译。**写语言无关串用 `AddString(ISOCode.Language.L___, 值)`**；读干净值优先 `GetStringToDisplay(源语言)`/`GetString(L___)`（多读法对比后取不带前缀者，DEBUG 留证）。**`InternalString` 是带内部语言标记的编码串**（形如 `??_??@文本;`），不能直接当显示值
+- **修改落库与撤销栈（实测纠正）**：
+  - `LockingStep` 只是对象锁容器（收集/释放锁柄，用于多人协作），**与撤销无关**；内置 `IEplAction`/模态对话框中平台隐式提供，**不要显式 new**（显式裸锁改数据会导致 EPLAN 撤销栈被清空、Ctrl+Z 和撤销按钮变灰）
+  - 让修改进入撤销栈的正确范式：`UndoStep` + `Transaction`：
+    ```csharp
+    var undo = new UndoManager().CreateUndoStep();
+    undo.SetUndoDescription("步骤提示");
+    using (var txn = new TransactionManager().CreateTransaction()) {
+        // ... 修改对象 ...
+        txn.Commit();
+    }
+    undo.CloseOpenUndo();   // 成为一个可 Ctrl+Z 的撤销点；绝不能调 undo.DoUndo()（那是立即编程撤销）
+    undo.Dispose();
+    ```
+  - 异常路径 `txn.Abort()`；无模式对话框/离线 EXE 才需另加显式 `LockingStep`
+  - **项目源语言**（项目设置，可人为调整，各项目不同）：`project.Properties.PROJ_SOURCELANGUAGE.ToInt()` 强转 `ISOCode.Language`（只读，Int64，值即枚举编号）；显示名用 `new ISOCode().GetLongName(lang)`
 
 ---
 
