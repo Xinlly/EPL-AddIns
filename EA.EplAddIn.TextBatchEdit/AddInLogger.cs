@@ -20,6 +20,7 @@ public static class AddInLogger
     public static void Info(string message) => Write("INFO ", message, null);
     public static void Warn(string message) => Write("WARN ", message, null);
     public static void Error(string message, Exception? ex) => Write("ERROR", message, ex);
+    public static void Error(string message) => Write("ERROR", message, null);
 
     private static string ResolveLogDirectory()
     {

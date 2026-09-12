@@ -184,7 +184,14 @@ new Decider().Decide(
     undo.Dispose();
     ```
   - 异常路径 `txn.Abort()`；无模式对话框/离线 EXE 才需另加显式 `LockingStep`
-  - **项目源语言**（项目设置，可人为调整，各项目不同）：`project.Properties.PROJ_SOURCELANGUAGE.ToInt()` 强转 `ISOCode.Language`（只读，Int64，值即枚举编号）；显示名用 `new ISOCode().GetLongName(lang)`
+  - **回读校验（防"UI 成功、模型未落库"）**：`txn.Commit()` 后重新读 `t.Contents`，逐语言比对期望值；不一致记 ERROR 并在结果对话框列出问题行，不假设全部生效
+  - **项目源语言 / 项目翻译语言（项目层级设置，可人为调整，各项目不同）**——设置 ID 权威来源：EPLAN 安装目录 `Bin\en-US\SettingsDesc.csv`（UTF-16，`XTrProjectSettingsTab`）；真实存储格式以"项目设置导出 XML"为准（`<CAT PROJECT><MOD TRANSLATEGUI>`）：
+    - **键不带 `PROJECT.` 前缀**：`ProjectSettings` 已锚定 PROJECT 分类，`project.Settings.GetStringSetting("TRANSLATEGUI.xxx", 0)`；带前缀反而抛 `S063108 设置路径不存在`（实测踩坑）
+    - 翻译语言集合：`TRANSLATEGUI.TRANSLATE_LANGUAGES` 是**单个分号串**（索引 0，如 `"en_US;zh_CN;ja_JP;"`），按 `';'` 拆分——**不是按索引多值**（我上一版按多值读，读空后只剩源语言，setter 整体替换还把其他语言清掉了）
+    - 源语言：`TRANSLATEGUI.SOURCE_LANGUAGE`（单值短码 `zh_CN`）；失败回退只读属性 `Properties.PROJ_SOURCELANGUAGE.ToInt()`
+    - 显示语言：`TRANSLATEGUI.DISPLAYED_LANGUAGES`（同样分号串，如 `zh_CN;en_US;`）
+    - 短码↔枚举：`new ISOCode().SetString(code)` 后无参 `GetNumber()`；枚举→短码 `GetString(lang)`
+  - **表格语言列结构**：独立"源语言"列置于最左，右侧依次为全部翻译语言（含源语言本身，按设置固定顺序）；源语言列与语言区里的源语言列双向同步值。未翻译行仅源语言列可编辑（语言无关串），语言区只读
 
 ---
 

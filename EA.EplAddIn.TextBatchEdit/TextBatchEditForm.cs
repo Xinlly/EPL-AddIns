@@ -5,58 +5,50 @@ using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.Linq;
+using System.Text;
 using System.Windows.Forms;
 
 namespace EA.EplAddIn.TextBatchEdit;
 
-/// <summary>
-/// 批量修改选中文本。显式区分两种文本：
-///  - 未翻译（语言无关串，所有语言显示相同）：值取自/写回源语言列；"翻译"复选框不勾
-///  - 已翻译（多语言）：中文 zh_CN / 英文 en_US 分列；复选框勾选
-/// 写回统一新建 MultiLangString 后经 TextBase.Contents 的 setter 赋回（getter 对象就地修改不落库）。
-/// </summary>
 public class TextBatchEditForm : Form
 {
+    private readonly List<TextBase> _texts;
+    private readonly ISOCode.Language _sourceLang;
+    private readonly List<ISOCode.Language> _projectLangs; // 固定顺序，首位为源语言
+    private readonly Dictionary<ISOCode.Language, int> _langCol = new();
+
+    private DataGridView _grid = null!;
+    private Button _applyBtn = null!;
+    private Button _closeBtn = null!;
+
     private const int ColIndex = 0;
     private const int ColType = 1;
     private const int ColTranslated = 2;
-    private const int ColZh = 3;
-    private const int ColEn = 4;
+    private const int ColSourceMirror = 3; // 独立"源语言"列，与项目语言区源语言列双向同步
+    private const int LangColStart = 4;
 
-    private readonly List<TextBase> _texts;
-    private readonly ISOCode.Language _sourceLang;
-    private readonly DataGridView _grid;
-    private ContextMenuStrip? _contextMenu;
+    private bool _syncing; // 镜像列同步防递归
 
-    public TextBatchEditForm(List<TextBase> texts)
+    public TextBatchEditForm(List<TextBase> texts,
+        ISOCode.Language sourceLang, List<ISOCode.Language> projectLangs)
     {
         _texts = texts;
-        AddInLogger.Debug("TextBatchEditForm..ctor: texts=" + texts.Count);
+        _sourceLang = sourceLang;
+        _projectLangs = projectLangs;
 
-        // 项目源语言：只读项目属性 PROJ_SOURCELANGUAGE（Int64，值即 ISOCode.Language 枚举编号）
-        _sourceLang = ISOCode.Language.L_zh_CN;
-        string sourceLangName;
-        try
-        {
-            var srcInt = texts[0].Project.Properties.PROJ_SOURCELANGUAGE.ToInt();
-            _sourceLang = (ISOCode.Language)srcInt;
-            using (var iso = new ISOCode())
-            {
-                sourceLangName = iso.GetLongName(_sourceLang);
-            }
-        }
-        catch (Exception ex)
-        {
-            AddInLogger.Error("读取项目源语言失败，按 zh_CN 处理", ex);
-            sourceLangName = "zh_CN（读取失败，按默认）";
-        }
-        AddInLogger.Info("项目源语言=" + _sourceLang + " (" + sourceLangName + ")");
-
-        Text = "批量修改选中文本 — 源语言：" + sourceLangName;
+        Text = "批量修改选中文本（源语言：" + LangHelper.Code(sourceLang) + "，共 " + texts.Count + " 个文本）";
         StartPosition = FormStartPosition.CenterScreen;
-        Size = new Size(820, 500);
-        MinimumSize = new Size(560, 320);
+        Width = 820;
+        Height = 560;
+        MinimumSize = new Size(560, 360);
 
+        BuildGrid();
+        BuildBottomBar();
+        LoadRows();
+    }
+
+    private void BuildGrid()
+    {
         _grid = new DataGridView
         {
             Dock = DockStyle.Fill,
@@ -69,31 +61,163 @@ public class TextBatchEditForm : Form
             BackgroundColor = System.Drawing.Color.White,
             ClipboardCopyMode = DataGridViewClipboardCopyMode.EnableWithoutHeaderText,
         };
+
         _grid.Columns.Add("idx", "#");
-        _grid.Columns.Add("type", "对象类型");
-        _grid.Columns.Add(new DataGridViewCheckBoxColumn { Name = "translated", HeaderText = "翻译", Width = 48 });
-        var zhHeader = "中文 zh_CN" + (_sourceLang == ISOCode.Language.L_zh_CN ? "（源语言）" : "");
-        var enHeader = "英文 en_US" + (_sourceLang == ISOCode.Language.L_en_US ? "（源语言）" : "");
-        _grid.Columns.Add("zh", zhHeader);
-        _grid.Columns.Add("en", enHeader);
-        _grid.Columns[ColIndex].Width = 44;
+        _grid.Columns[ColIndex].Width = 42;
         _grid.Columns[ColIndex].ReadOnly = true;
-        _grid.Columns[ColType].Width = 100;
+        _grid.Columns[ColIndex].SortMode = DataGridViewColumnSortMode.NotSortable;
+
+        _grid.Columns.Add("type", "对象类型");
+        _grid.Columns[ColType].Width = 110;
         _grid.Columns[ColType].ReadOnly = true;
-        _grid.Columns[ColZh].Width = 290;
-        _grid.Columns[ColEn].Width = 290;
+        _grid.Columns[ColType].SortMode = DataGridViewColumnSortMode.NotSortable;
 
-        var unknown = ISOCode.Language.L___;
-        var zh = ISOCode.Language.L_zh_CN;
-        var en = ISOCode.Language.L_en_US;
+        _grid.Columns.Add(new DataGridViewCheckBoxColumn { Name = "translated", HeaderText = "翻译", Width = 52 });
+        _grid.Columns[ColTranslated].SortMode = DataGridViewColumnSortMode.NotSortable;
 
-        for (var i = 0; i < texts.Count; i++)
+        // 独立源语言列（最左语言列）
+        _grid.Columns.Add("srcMirror", "源语言(" + LangHelper.Code(_sourceLang) + ")");
+        _grid.Columns[ColSourceMirror].Width = 200;
+        _grid.Columns[ColSourceMirror].SortMode = DataGridViewColumnSortMode.NotSortable;
+
+        // 项目语言列（含源语言本身），固定顺序
+        for (var i = 0; i < _projectLangs.Count; i++)
         {
-            var t = texts[i];
+            var lang = _projectLangs[i];
+            var colIdx = LangColStart + i;
+            var title = LangHelper.Code(lang) + (lang == _sourceLang ? "（源语言）" : "");
+            _grid.Columns.Add("lang_" + LangHelper.Code(lang), title);
+            _grid.Columns[colIdx].Width = 200;
+            _grid.Columns[colIdx].SortMode = DataGridViewColumnSortMode.NotSortable;
+            _langCol[lang] = colIdx;
+        }
+
+        // 复选框切换 → 行可编辑状态 + 镜像列同步
+        _grid.CurrentCellDirtyStateChanged += (_, _) =>
+        {
+            if (_grid.IsCurrentCellDirty && _grid.CurrentCell?.ColumnIndex == ColTranslated)
+            {
+                _grid.CommitEdit(DataGridViewDataErrorContexts.Commit);
+            }
+        };
+        _grid.CellValueChanged += (_, e) =>
+        {
+            if (e.RowIndex < 0) { return; }
+            if (e.ColumnIndex == ColTranslated)
+            {
+                var tr = Convert.ToBoolean(_grid[ColTranslated, e.RowIndex].Value ?? false);
+                SetRowEditable(e.RowIndex, tr);
+                AddInLogger.Debug("行" + (e.RowIndex + 1) + " 翻译复选框=" + tr);
+            }
+            else if (!_syncing)
+            {
+                SyncMirror(e.RowIndex, e.ColumnIndex);
+            }
+        };
+
+        // 右键菜单
+        var menu = new ContextMenuStrip();
+        menu.Items.Add("复制(&C)", null, (_, _) => CopySelection());
+        menu.Items.Add("剪切(&X)", null, (_, _) => CutSelection());
+        menu.Items.Add("粘贴(&V)", null, (_, _) => PasteClipboard());
+        menu.Items.Add("清除内容(&D)", null, (_, _) => ClearSelection());
+        menu.Opening += (_, _) => AddInLogger.Debug("右键菜单 Opening");
+        _grid.ContextMenuStrip = menu;
+
+        // 快捷键兜底（在 ACP/EPLAN 宿主里 DataGridView 快捷键可能被拦截）
+        _grid.KeyDown += GridOnKeyDown;
+        _grid.CellMouseClick += GridOnCellMouseClick;
+        _grid.DataError += (_, e) =>
+        {
+            AddInLogger.Warn("网格 DataError: ctx=" + e.Context + " " + (e.Exception?.Message ?? ""));
+            e.ThrowException = false;
+        };
+
+        Controls.Add(_grid);
+    }
+
+    /// <summary>未翻译：仅镜像列可编辑，项目语言区只读；已翻译：全部语言列可编辑。</summary>
+    private void SetRowEditable(int row, bool translated)
+    {
+        for (var c = LangColStart; c < LangColStart + _projectLangs.Count; c++)
+        {
+            _grid[c, row].ReadOnly = !translated;
+            _grid[c, row].Style.BackColor = translated
+                ? System.Drawing.Color.White
+                : System.Drawing.Color.FromArgb(245, 245, 245);
+        }
+    }
+
+    /// <summary>镜像列 ↔ 项目语言区源语言列 双向同步。</summary>
+    private void SyncMirror(int row, int changedCol)
+    {
+        var srcProjectCol = _langCol[_sourceLang];
+        _syncing = true;
+        try
+        {
+            if (changedCol == ColSourceMirror)
+            {
+                _grid[srcProjectCol, row].Value = _grid[ColSourceMirror, row].Value;
+            }
+            else if (changedCol == srcProjectCol)
+            {
+                _grid[ColSourceMirror, row].Value = _grid[srcProjectCol, row].Value;
+            }
+        }
+        finally
+        {
+            _syncing = false;
+        }
+    }
+
+    private void BuildBottomBar()
+    {
+        var panel = new BufferedPanel { Dock = DockStyle.Bottom, Height = 86 };
+
+        var tip = new Label
+        {
+            Text = "勾选\"翻译\"=已翻译多语言文本（各语言列可编辑）；不勾选=未翻译（仅左侧源语言列可编辑，写为语言无关串）。\n"
+                 + "支持框选后 Ctrl+C/X/V 块复制粘贴（Tab 分列、换行分行，可与 Excel 互贴），Delete 清除。",
+            Dock = DockStyle.Top,
+            Height = 40,
+            TextAlign = ContentAlignment.MiddleLeft,
+            Padding = new Padding(10, 2, 10, 0),
+        };
+
+        var btnPanel = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = 40, FlowDirection = FlowDirection.RightToLeft };
+
+        _closeBtn = new Button { Text = "关闭", Width = 90, Height = 28, Margin = new Padding(6, 6, 10, 6) };
+        _closeBtn.Click += (_, _) => Close();
+
+        _applyBtn = new Button { Text = "写回 EPLAN", Width = 120, Height = 28, Margin = new Padding(6) };
+        _applyBtn.Click += (_, _) => ApplyChanges();
+
+        btnPanel.Controls.Add(_closeBtn);
+        btnPanel.Controls.Add(_applyBtn);
+
+        panel.Controls.Add(tip);
+        panel.Controls.Add(btnPanel);
+        Controls.Add(panel);
+
+        // 底栏双缓冲再保险：列宽变化后强制底栏重绘
+        _grid.ColumnWidthChanged += (_, _) => panel.Invalidate(true);
+    }
+
+    private void LoadRows()
+    {
+        AddInLogger.Info("LoadRows: count=" + _texts.Count
+            + " 项目语言=[" + string.Join(",", _projectLangs.Select(LangHelper.Code)) + "] 源语言=" + _sourceLang);
+        var unknown = ISOCode.Language.L___;
+
+        _grid.Rows.Clear();
+        for (var i = 0; i < _texts.Count; i++)
+        {
+            var t = _texts[i];
+            var typeName = t.GetType().Name;
             var isTranslated = true;
-            var sourceVal = string.Empty;
-            var zhVal = string.Empty;
-            var enVal = string.Empty;
+            var values = new Dictionary<ISOCode.Language, string>();
+            string mirrorVal = string.Empty;
+
             try
             {
                 var c = t.Contents;
@@ -110,14 +234,13 @@ public class TextBatchEditForm : Form
 
                 string pageName;
                 try { pageName = t.Page?.Name ?? "(无页)"; } catch { pageName = "(取页失败)"; }
-                AddInLogger.Debug("选中[" + i + "] 类型=" + t.GetType().Name
-                    + " 页=" + pageName + " DBID=" + Safe(() => t.DatabaseIdentifier.ToString())
+                AddInLogger.Debug("选中[" + i + "] 类型=" + typeName + " 页=" + pageName
+                    + " DBID=" + Safe(() => t.DatabaseIdentifier.ToString())
                     + " 语言列表=[" + string.Join(",", langNames) + "]"
                     + " InternalString=" + Preview(c.InternalString));
 
                 if (langs.Count == 0 || hasUnknown)
                 {
-                    // 未翻译（语言无关串）：多路读取，DEBUG 留证，取第一个不带内部前缀的干净值
                     isTranslated = false;
                     var byDisplay = Safe(() => c.GetStringToDisplay(_sourceLang));
                     var byUnknown = Safe(() => c.GetString(unknown));
@@ -125,17 +248,18 @@ public class TextBatchEditForm : Form
                     AddInLogger.Debug("  未翻译读法对比 GetStringToDisplay(" + _sourceLang + ")=" + Preview(byDisplay)
                         + " | GetString(L___)=" + Preview(byUnknown)
                         + " | InternalString=" + Preview(internalRaw));
-                    sourceVal = PickClean(byDisplay, byUnknown, internalRaw);
+                    mirrorVal = PickClean(byDisplay, byUnknown, internalRaw);
                 }
                 else
                 {
-                    zhVal = c.GetString(zh) ?? string.Empty;
-                    enVal = c.GetString(en) ?? string.Empty;
-                    AddInLogger.Debug("  已翻译读取 zh_CN=" + Preview(zhVal) + " en_US=" + Preview(enVal));
-                    if (_sourceLang != zh && _sourceLang != en)
+                    foreach (var lang in _projectLangs)
                     {
-                        AddInLogger.Warn("行" + (i + 1) + " 源语言 " + _sourceLang + " 非中英，未翻译值映射暂不支持，按空处理");
+                        var v = Safe(() => c.GetString(lang));
+                        values[lang] = (v == "(null)" || v.StartsWith("(")) ? string.Empty : v;
                     }
+                    mirrorVal = values.TryGetValue(_sourceLang, out var sv) ? sv : string.Empty;
+                    var dbg = string.Join(" ", _projectLangs.Select(l => LangHelper.Code(l) + "=" + Preview(values.TryGetValue(l, out var x) ? x : "")));
+                    AddInLogger.Debug("  已翻译读取 " + dbg);
                 }
             }
             catch (Exception ex)
@@ -143,220 +267,156 @@ public class TextBatchEditForm : Form
                 AddInLogger.Error("读取对象 " + i + " 文本失败", ex);
             }
 
-            if (!isTranslated)
+            var rowIdx = _grid.Rows.Add();
+            var row = _grid.Rows[rowIdx];
+            row.Cells[ColIndex].Value = (i + 1).ToString();
+            row.Cells[ColType].Value = typeName;
+            row.Cells[ColTranslated].Value = isTranslated;
+            row.Cells[ColSourceMirror].Value = mirrorVal;
+            foreach (var lang in _projectLangs)
             {
-                if (_sourceLang == en) { enVal = sourceVal; }
-                else { zhVal = sourceVal; }
+                var col = _langCol[lang];
+                if (isTranslated)
+                {
+                    row.Cells[col].Value = values.TryGetValue(lang, out var v) ? v : string.Empty;
+                }
+                else
+                {
+                    // 未翻译：源语言项目列也显示镜像值（同步），其余留空
+                    row.Cells[col].Value = lang == _sourceLang ? mirrorVal : string.Empty;
+                }
             }
-
-            _grid.Rows.Add((i + 1).ToString(), t.GetType().Name, isTranslated, zhVal, enVal);
-            ApplyRowEditState(i, isTranslated);
-        }
-
-        BuildContextMenu();
-        _grid.CellMouseClick += GridOnCellMouseClick;
-        _grid.CurrentCellDirtyStateChanged += GridOnDirtyStateChanged;
-        _grid.CellValueChanged += GridOnCellValueChanged;
-        _grid.KeyDown += GridOnKeyDown;
-
-        var buttonPanel = new BufferedPanel { Dock = DockStyle.Bottom, Height = 44 };
-        _grid.ColumnWidthChanged += (_, _) => buttonPanel.Invalidate(true);
-
-        var hint = new Label
-        {
-            Text = "勾选\"翻译\"=多语言文本；不勾选=未翻译（仅源语言列生效）。Ctrl+C/X/V 块粘贴；Delete 清空；右键菜单",
-            Location = new Point(10, 14),
-            AutoSize = true,
-        };
-        var applyButton = new Button { Text = "写回 EPLAN", Size = new Size(110, 28) };
-        applyButton.Click += (_, _) => ApplyChanges();
-        var closeButton = new Button { Text = "关闭", Size = new Size(72, 28) };
-        closeButton.Click += (_, _) => Close();
-        buttonPanel.Controls.Add(hint);
-        buttonPanel.Controls.Add(applyButton);
-        buttonPanel.Controls.Add(closeButton);
-        buttonPanel.Resize += (_, _) =>
-        {
-            closeButton.Location = new Point(buttonPanel.Width - closeButton.Width - 12, 8);
-            applyButton.Location = new Point(closeButton.Left - applyButton.Width - 8, 8);
-        };
-
-        Controls.Add(buttonPanel);
-        Controls.Add(_grid);
-        AcceptButton = applyButton;
-        CancelButton = closeButton;
-    }
-
-    /// <summary>按翻译勾选状态切换该行非源语言列的可编辑性。</summary>
-    private void ApplyRowEditState(int row, bool translated)
-    {
-        var nonSourceCol = _sourceLang == ISOCode.Language.L_en_US ? ColZh : ColEn;
-        _grid[nonSourceCol, row].ReadOnly = !translated;
-        _grid[nonSourceCol, row].Style.BackColor = translated
-            ? System.Drawing.Color.White
-            : System.Drawing.Color.FromArgb(240, 240, 240);
-    }
-
-    // 复选框提交即时生效（默认需失去焦点）
-    private void GridOnDirtyStateChanged(object? sender, EventArgs e)
-    {
-        if (_grid.IsCurrentCellDirty && _grid.CurrentCell?.ColumnIndex == ColTranslated)
-        {
-            _grid.CommitEdit(DataGridViewDataErrorContexts.Commit);
+            SetRowEditable(rowIdx, isTranslated);
         }
     }
 
-    private void GridOnCellValueChanged(object? sender, DataGridViewCellEventArgs e)
-    {
-        if (e.RowIndex < 0 || e.ColumnIndex != ColTranslated) { return; }
-        var translated = Convert.ToBoolean(_grid[ColTranslated, e.RowIndex].Value ?? false);
-        ApplyRowEditState(e.RowIndex, translated);
-        AddInLogger.Debug("行" + (e.RowIndex + 1) + " 翻译标志=" + translated);
-    }
-
-    private bool IsEditing() => _grid.IsCurrentCellInEditMode;
-
-    // ---------- 右键菜单 ----------
-
-    private void BuildContextMenu()
-    {
-        _contextMenu = new ContextMenuStrip();
-        _contextMenu.Items.Add("剪切(&T)\tCtrl+X", null, (_, _) => CutSelection());
-        _contextMenu.Items.Add("复制(&C)\tCtrl+C", null, (_, _) => CopySelection());
-        _contextMenu.Items.Add("粘贴(&P)\tCtrl+V", null, (_, _) => PasteClipboard());
-        _contextMenu.Items.Add("清除内容(&D)\tDel", null, (_, _) => ClearSelectionValues());
-        _contextMenu.Items.Add(new ToolStripSeparator());
-        _contextMenu.Items.Add("全选(&A)\tCtrl+A", null, (_, _) => _grid.SelectAll());
-        _grid.ContextMenuStrip = _contextMenu;
-    }
-
-    private void GridOnCellMouseClick(object? sender, DataGridViewCellMouseEventArgs e)
+    private void GridOnCellMouseClick(object? s, DataGridViewCellMouseEventArgs e)
     {
         if (e.Button != MouseButtons.Right || e.RowIndex < 0 || e.ColumnIndex < 0) { return; }
-        var cell = _grid[e.ColumnIndex, e.RowIndex];
-        if (!cell.Selected) { _grid.CurrentCell = cell; }
+        AddInLogger.Debug("右键 行=" + (e.RowIndex + 1) + " 列=" + _grid.Columns[e.ColumnIndex].Name
+            + " 选中格数=" + _grid.SelectedCells.Count);
+        if (!_grid[e.ColumnIndex, e.RowIndex].Selected)
+        {
+            _grid.CurrentCell = _grid[e.ColumnIndex, e.RowIndex];
+        }
     }
-
-    // ---------- 快捷键（编辑态不拦截；复选框列不拦截）----------
 
     private void GridOnKeyDown(object? sender, KeyEventArgs e)
     {
-        if (IsEditing()) { return; }
+        if (IsEditing()) { return; } // 编辑中走原生，保证文字输入
         if (e.Control && e.KeyCode == Keys.C) { CopySelection(); e.Handled = true; }
         else if (e.Control && e.KeyCode == Keys.X) { CutSelection(); e.Handled = true; }
         else if (e.Control && e.KeyCode == Keys.V) { PasteClipboard(); e.Handled = true; }
-        else if (e.Control && e.KeyCode == Keys.A) { _grid.SelectAll(); e.Handled = true; }
-        else if (e.KeyCode == Keys.Delete) { ClearSelectionValues(); e.Handled = true; }
+        else if (e.KeyCode == Keys.Delete) { ClearSelection(); e.Handled = true; }
     }
 
-    // ---------- 剪贴板（只读列 #/类型/翻译 不接受粘贴）----------
+    private bool IsEditing() => _grid.IsCurrentCellInEditMode || _grid.EditingControl != null;
+
+    private List<DataGridViewCell> EditableSelectedCells() =>
+        _grid.SelectedCells.Cast<DataGridViewCell>()
+            .Where(c => c.RowIndex >= 0 && !c.ReadOnly
+                && c.ColumnIndex != ColIndex && c.ColumnIndex != ColType && c.ColumnIndex != ColTranslated)
+            .ToList();
 
     private void CopySelection()
     {
-        if (_grid.SelectedCells.Count == 0) { return; }
-        try
-        {
-            var content = _grid.GetClipboardContent();
-            if (content == null) { return; }
-            Clipboard.SetDataObject(content);
-            AddInLogger.Info("CopySelection: cells=" + _grid.SelectedCells.Count);
-        }
-        catch (Exception ex) { AddInLogger.Error("CopySelection 异常", ex); }
+        var cells = _grid.SelectedCells.Cast<DataGridViewCell>()
+            .Where(c => c.RowIndex >= 0).ToList();
+        if (cells.Count == 0) { AddInLogger.Debug("Copy: 无选区"); return; }
+        var content = _grid.GetClipboardContent();
+        if (content == null) { AddInLogger.Warn("CopySelection: GetClipboardContent 返回 null"); return; }
+        Clipboard.SetDataObject(content);
+        AddInLogger.Debug("Copy: 选中格=" + cells.Count);
     }
 
     private void CutSelection()
     {
-        if (_grid.SelectedCells.Count == 0) { return; }
+        var cells = EditableSelectedCells();
+        if (cells.Count == 0) { return; }
         CopySelection();
-        ClearSelectionValues();
+        foreach (var c in cells)
+        {
+            c.Value = string.Empty;
+            SyncMirror(c.RowIndex, c.ColumnIndex);
+        }
+        AddInLogger.Debug("Cut: 清空 " + cells.Count + " 格");
+    }
+
+    private void ClearSelection()
+    {
+        var cells = EditableSelectedCells();
+        if (cells.Count == 0) { return; }
+        foreach (var c in cells)
+        {
+            c.Value = string.Empty;
+            SyncMirror(c.RowIndex, c.ColumnIndex);
+        }
+        AddInLogger.Debug("Delete: 清空 " + cells.Count + " 格");
     }
 
     private void PasteClipboard()
     {
-        var anchor = SelectionAnchorCell;
-        if (anchor == null) { return; }
-        if (anchor.ReadOnly || anchor.ColumnIndex == ColTranslated)
+        var cells = EditableSelectedCells();
+        if (cells.Count == 0)
         {
-            AddInLogger.Warn("Paste: 起点为只读/复选框列，忽略");
+            AddInLogger.Debug("Paste: 无可编辑选区");
+            MessageBox.Show("请先选择要粘贴的目标单元格（语言数据列）。", "批量修改选中文本",
+                MessageBoxButtons.OK, MessageBoxIcon.Information);
             return;
         }
 
-        var text = Clipboard.GetDataObject()?.GetData(DataFormats.Text) as string;
-        if (string.IsNullOrEmpty(text)) { return; }
+        var text = Clipboard.GetText(TextDataFormat.Text);
+        if (string.IsNullOrEmpty(text)) { AddInLogger.Debug("Paste: 剪贴板无文本"); return; }
+
+        var anchor = SelectionAnchorCell();
+        if (anchor == null) { return; }
 
         var lines = text!.Replace("\r\n", "\n").TrimEnd('\n').Split('\n');
-        var startRow = anchor.RowIndex;
-        var startCol = anchor.ColumnIndex;
         var pasted = 0;
-        foreach (DataGridViewCell c in _grid.SelectedCells) { c.Selected = false; }
-
         for (var r = 0; r < lines.Length; r++)
         {
-            var targetRow = startRow + r;
-            if (targetRow >= _grid.Rows.Count) { break; }
+            var rowIdx = anchor.RowIndex + r;
+            if (rowIdx >= _grid.Rows.Count) { break; }
             var fields = lines[r].Split('\t');
             for (var c = 0; c < fields.Length; c++)
             {
-                var targetCol = startCol + c;
-                if (targetCol >= _grid.ColumnCount) { break; }
-                if (targetCol == ColIndex || targetCol == ColType || targetCol == ColTranslated) { continue; }
-                if (_grid[targetCol, targetRow].ReadOnly) { continue; }
-                _grid[targetCol, targetRow].Value = fields[c];
-                _grid[targetCol, targetRow].Selected = true;
+                var colIdx = anchor.ColumnIndex + c;
+                if (colIdx >= LangColStart + _projectLangs.Count || colIdx < ColSourceMirror) { continue; }
+                var cell = _grid[colIdx, rowIdx];
+                if (cell.ReadOnly) { continue; }
+                cell.Value = fields[c];
+                SyncMirror(rowIdx, colIdx);
                 pasted++;
             }
         }
-        AddInLogger.Info("Paste: 起点(r" + startRow + ",c" + startCol + ") 写入格数=" + pasted);
+        AddInLogger.Debug("Paste: 写入 " + pasted + " 格，起点 行" + (anchor.RowIndex + 1) + " 列" + _grid.Columns[anchor.ColumnIndex].Name);
     }
 
-    private DataGridViewCell? SelectionAnchorCell
+    /// <summary>粘贴起点：选区左上角（最小行、最小列）；单选退回 CurrentCell。</summary>
+    private DataGridViewCell? SelectionAnchorCell()
     {
-        get
-        {
-            if (_grid.SelectedCells.Count == 0) { return _grid.CurrentCell; }
-            var minRow = int.MaxValue; var minCol = int.MaxValue;
-            foreach (DataGridViewCell cell in _grid.SelectedCells)
-            {
-                minRow = Math.Min(minRow, cell.RowIndex);
-                minCol = Math.Min(minCol, cell.ColumnIndex);
-            }
-            return _grid[minCol, minRow];
-        }
+        var cells = _grid.SelectedCells.Cast<DataGridViewCell>()
+            .Where(c => c.RowIndex >= 0).ToList();
+        if (cells.Count == 0) { return null; }
+        if (cells.Count == 1) { return _grid.CurrentCell; }
+        var minRow = cells.Min(c => c.RowIndex);
+        var minCol = cells.Where(c => c.RowIndex == minRow).Min(c => c.ColumnIndex);
+        return _grid[minCol, minRow];
     }
-
-    private void ClearSelectionValues()
-    {
-        var cleared = 0;
-        foreach (DataGridViewCell cell in _grid.SelectedCells)
-        {
-            if (!cell.ReadOnly && cell.ColumnIndex != ColTranslated && cell.RowIndex != _grid.NewRowIndex)
-            {
-                cell.Value = null;
-                cleared++;
-            }
-        }
-        AddInLogger.Info("ClearSelectionValues: cleared=" + cleared);
-    }
-
-    // ---------- 写回 EPLAN ----------
 
     private void ApplyChanges()
     {
         AddInLogger.Info("ApplyChanges: begin, rows=" + _grid.Rows.Count);
-        var zh = ISOCode.Language.L_zh_CN;
-        var en = ISOCode.Language.L_en_US;
         var unknown = ISOCode.Language.L___;
         var changedObjects = 0;
+        var mismatchRows = new List<int>();
 
-        // 进入撤销栈的正确范式：UndoStep 包住一个 Transaction，修改后 Commit；
-        // 绝不能调 undo.DoUndo()（那是编程式立即撤销）。LockingStep 只是对象锁，与撤销无关，
-        // 且本代码运行在内置 IEplAction 内（平台隐式提供 LockingStep），无需显式创建。
         UndoStep? undo = null;
         Transaction? txn = null;
         try
         {
             undo = new UndoManager().CreateUndoStep();
-            undo.SetUndoDescription("批量修改选中文本（中英文）");
+            undo.SetUndoDescription("批量修改选中文本");
             txn = new TransactionManager().CreateTransaction();
 
             for (var i = 0; i < _texts.Count; i++)
@@ -369,50 +429,97 @@ public class TextBatchEditForm : Form
                 }
 
                 var translated = Convert.ToBoolean(_grid[ColTranslated, i].Value ?? false);
-                var zhVal = _grid[ColZh, i].Value as string ?? string.Empty;
-                var enVal = _grid[ColEn, i].Value as string ?? string.Empty;
+                var mirrorVal = _grid[ColSourceMirror, i].Value as string ?? string.Empty;
 
-                // 记录 before
-                var beforeMls = t.Contents;
-                var beforeZh = Safe(() => beforeMls.GetString(zh));
-                var beforeEn = Safe(() => beforeMls.GetString(en));
-                var beforeInternal = Preview(beforeMls.InternalString);
-
-                // 新建 MultiLangString 写好后经 setter 整体赋回（对 getter 对象就地改不落库）
-                var mls = new MultiLangString();
+                // 期望写入：语言 → 值
+                var expected = new Dictionary<ISOCode.Language, string>();
                 string mode;
                 if (translated)
                 {
-                    if (zhVal.Length > 0) { mls.AddString(zh, zhVal); }
-                    if (enVal.Length > 0) { mls.AddString(en, enVal); }
-                    mode = "已翻译 zh/en";
+                    foreach (var lang in _projectLangs)
+                    {
+                        var v = _grid[_langCol[lang], i].Value as string ?? string.Empty;
+                        if (v.Length > 0) { expected[lang] = v; }
+                    }
+                    mode = "已翻译 语言数=" + expected.Count;
                 }
                 else
                 {
-                    // 未翻译：语言无关串。用 AddString(L___) 写入（L___ 官方语义=设置语言无关串）
-                    var sourceVal = _sourceLang == en ? enVal : zhVal;
-                    mls.AddString(unknown, sourceVal);
-                    mode = "未翻译(语言无关串) 源语言=" + _sourceLang;
+                    expected[unknown] = mirrorVal;
+                    mode = "未翻译(语言无关串)";
                 }
 
+                var beforeInternal = Preview(t.Contents.InternalString);
+                var mls = new MultiLangString();
+                foreach (var kv in expected) { mls.AddString(kv.Key, kv.Value); }
                 t.Contents = mls;
                 changedObjects++;
+
                 AddInLogger.Debug("写回 行" + (i + 1) + " " + mode
-                    + "\n    before: zh=" + Preview(beforeZh) + " en=" + Preview(beforeEn) + " internal=" + beforeInternal
-                    + "\n    after : zh=" + Preview(zhVal) + " en=" + Preview(enVal));
+                    + "\n    before internal=" + beforeInternal
+                    + "\n    after : " + string.Join(" ", expected.Select(kv => LangHelper.Code(kv.Key) + "=" + Preview(kv.Value))));
             }
 
             txn.Commit();
             txn.Dispose();
             txn = null;
-            // 关闭撤销步：提交的修改成为一个可 Ctrl+Z 的撤销点（不调 DoUndo）
             undo.CloseOpenUndo();
             undo.Dispose();
             undo = null;
 
-            AddInLogger.Info("ApplyChanges: 完成 对象数=" + changedObjects);
-            MessageBox.Show("已写回 " + changedObjects + " 个文本对象。\n可在 EPLAN 中用 Ctrl+Z 撤销本批修改。",
-                "批量修改选中文本", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            // 回读校验：提交后重读每个对象，逐语言比对
+            for (var i = 0; i < _texts.Count; i++)
+            {
+                var t = _texts[i];
+                if (!t.IsValid) { continue; }
+                var translated = Convert.ToBoolean(_grid[ColTranslated, i].Value ?? false);
+                var mirrorVal = _grid[ColSourceMirror, i].Value as string ?? string.Empty;
+                var c = t.Contents;
+                bool rowOk = true;
+
+                if (translated)
+                {
+                    foreach (var lang in _projectLangs)
+                    {
+                        var want = _grid[_langCol[lang], i].Value as string ?? string.Empty;
+                        var actual = ReadSafe(c, lang);
+                        if (!string.Equals(want, actual, StringComparison.Ordinal))
+                        {
+                            rowOk = false;
+                            AddInLogger.Error("回读不一致 行" + (i + 1) + " " + LangHelper.Code(lang)
+                                + " 期望=" + Preview(want) + " 实际=" + Preview(actual));
+                        }
+                    }
+                }
+                else
+                {
+                    var actual = PickClean(
+                        Safe(() => c.GetStringToDisplay(_sourceLang)),
+                        Safe(() => c.GetString(unknown)),
+                        c.InternalString ?? string.Empty);
+                    if (!string.Equals(mirrorVal, actual, StringComparison.Ordinal))
+                    {
+                        rowOk = false;
+                        AddInLogger.Error("回读不一致 行" + (i + 1) + " 未翻译 期望=" + Preview(mirrorVal) + " 实际=" + Preview(actual));
+                    }
+                }
+                if (!rowOk) { mismatchRows.Add(i + 1); }
+            }
+
+            AddInLogger.Info("ApplyChanges: 完成 对象数=" + changedObjects
+                + (mismatchRows.Count > 0 ? " 回读不一致行=[" + string.Join(",", mismatchRows) + "]" : " 回读校验全部一致"));
+
+            var msg = "已写回 " + changedObjects + " 个文本对象。\n可在 EPLAN 中用 Ctrl+Z 撤销本批修改。";
+            if (mismatchRows.Count > 0)
+            {
+                msg = "写回 " + changedObjects + " 个对象，但回读校验发现 " + mismatchRows.Count
+                    + " 行与期望不一致（行 " + string.Join(",", mismatchRows.Take(20)) + "）。\n请查看日志，勿假设已全部生效。";
+                MessageBox.Show(msg, "批量修改选中文本", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
+            else
+            {
+                MessageBox.Show(msg, "批量修改选中文本", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
         }
         catch (Exception ex)
         {
@@ -428,13 +535,18 @@ public class TextBatchEditForm : Form
         }
     }
 
+    private static string ReadSafe(MultiLangString c, ISOCode.Language lang)
+    {
+        try { return c.GetString(lang) ?? string.Empty; }
+        catch { return string.Empty; }
+    }
+
     private static string Safe(Func<string?> fn)
     {
         try { return fn() ?? "(null)"; }
         catch (Exception ex) { return "(" + ex.GetType().Name + ")"; }
     }
 
-    /// <summary>日志预览：长度 + 截断 100 字符，换行转义。</summary>
     private static string Preview(string? s)
     {
         if (s == null) { return "(null)"; }
@@ -442,15 +554,11 @@ public class TextBatchEditForm : Form
         return "[len=" + s.Length + "]" + (one.Length > 100 ? one.Substring(0, 100) + "…" : one);
     }
 
-    /// <summary>从多路读法中取第一个不带内部语言标记（??_??@…;）的干净值；都带则剥掉标记。</summary>
     private static string PickClean(params string[] candidates)
     {
         foreach (var c in candidates)
         {
-            if (!string.IsNullOrEmpty(c) && !c.StartsWith("??_??@"))
-            {
-                return c;
-            }
+            if (!string.IsNullOrEmpty(c) && !c.StartsWith("??_??@")) { return c; }
         }
         foreach (var c in candidates)
         {
