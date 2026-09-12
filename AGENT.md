@@ -22,8 +22,11 @@ EPL-AddIns/
 ├── EPL-AddIns.slnx              # Visual Studio 解决方案（XML 格式，多项目容器）
 ├── EA.EplAddIn.Test/            # 第一个 Add-in：Hello World 骨架
 │   ├── EA.EplAddIn.Test.csproj
-│   ├── Class1.cs                # IEplAddIn 实现：注册/生命周期/菜单
-│   └── HelloWorldAction.cs      # IEplAction 实现
+│   ├── Class1.cs                # IEplAddIn 实现：注册/生命周期/菜单/全局异常
+│   ├── AddInLogger.cs           # 文件日志（DEBUG/INFO/WARN/ERROR，按天一个文件）
+│   ├── HelloWorldAction.cs      # IEplAction 实现
+│   ├── TableEditorForm.cs       # WinForms 表格编辑窗口（DataGridView，界面演示）
+│   └── TableEditorAction.cs     # 打开表格窗口的 Action
 ├── references/                  # 本地引用程序集（不入库，见下）
 │   └── EplApi/*.dll             # 从 EPLAN 2.9 安装目录复制
 ├── AGENT.md
@@ -52,11 +55,27 @@ dotnet build EPL-AddIns.slnx
 - 跨平台开发时可在 WSL 中调用 Windows 的 dotnet：`"/mnt/c/Program Files/dotnet/dotnet.exe" build EPL-AddIns.slnx`
 - 重命名项目/目录后若出现怪问题，删除 `.vs/`、`bin/`、`obj/` 后重新生成。
 
+### 程序集版本号（构建标识）
+
+- csproj 在编译时用 MSBuild 属性把 `AssemblyVersion`/`FileVersion` 固化为 **`yy.M.d.HHmm`**（如 `26.9.12.1016`），`InformationalVersion` 为 `yyyy-MM-dd-HHmm`：
+  - 四段均为数字且 <65535，符合 .NET 程序集版本限制；同一天内每分钟一次构建不会冲突
+  - 版本在**编译时**写入 DLL，重启 EPLAN 不变——不要用运行时 `DateTime.Now` 做构建标识（每次启动都变，无意义）
+- 用途：判断 EPLAN 实际加载的 DLL 是不是最新构建。打开 EPLAN 的 **API 模块（拼接软件）** 对话框，"装配名称"列显示 `EA.EplAddIn.Test, Version=26.9.12.1016, Culture=neutral, PublicKeyToken=null`；版本后四段 = 最近一次编译时间即为新 DLL
+- 插件日志 `OnInit` 也会记录程序集全名（含版本），可与对话框对照
+- 注意：版本号变化后旧注册不会自动更新，需在 Add-in/API 模块管理器中**卸载旧 DLL 再重新加载**；EPLAN 另有 ShadowCopy 缓存（`%AppData%\EPLAN\ShadowCopyAssemblies\`），怀疑加载旧缓存时先在管理器卸载、完全退出 EPLAN，再清该目录后重新加载
+
 ### 协作约定（AI 协作者必守）
 
-- **未经用户明确要求，不要主动执行编译。** 代码修改与构建验证是两个动作，修改完成后等待指示再 build。
+- **默认在代码修改完成后自动执行 `dotnet build` 验证编译通过**（2026-09-11 起的约定，无需等待指示）；用户明确说"先别编译"时例外。
 - 修改代码只动与需求直接相关的行，禁止整文件重写、顺手改格式/注释。
 - EPLAN 实际加载、注册、运行测试由用户在 Windows 的 EPLAN 中完成；助手无法启动 EPLAN，不得声称"已验证运行"。
+
+### 日志（AddInLogger）
+
+- 文件：`AddInLogger.cs`，四级 `Debug/Info/Warn/Error`（含异常完整堆栈），按天一个文件 `addin-yyyy-MM-dd.log`
+- 位置：DLL 旁 `logs\`（即 `bin\Debug\net472\logs\`）；DLL 目录不可写时自动降级 `%TEMP%\EA.EplAddIn.Test\logs`
+- 排障时看日志：时间戳 + 级别 + 线程 ID + 消息；`OnInit` 订阅了 UI 线程异常和 AppDomain 未处理异常
+- 当前为调试期默认 `MinLevel=Debug`，正式分发前改为 `Info`（未来接 App.config 的 `log4net`/`Serilog` 之前，这个轻量实现够用）
 
 ### Git 提交与推送身份
 
@@ -143,6 +162,7 @@ Hello World 骨架，验证 Add-in 全链路：
 
 - `Class1 : IEplAddIn`：`OnRegister` 设 `bLoadOnStart = true` 并弹"插件已加载！"提示（标题 "MyFirst Add-in"）；`OnInitGui` 注册"Hello World"菜单
 - `HelloWorldAction : IEplAction`：`[DeclareAction("HelloWorldAction")]`，执行时弹"Hello World!"
+- `TableEditorForm` / `TableEditorAction`：WinForms `DataGridView` 表格式编辑窗口（4 列演示数据，就地编辑、底部空行新增），支持矩形区域 Ctrl+C/X/V 块复制粘贴（Tab/换行分隔，可与 Excel 互贴）、Delete 清空、右键菜单（剪切/复制/粘贴/清除/全选）；菜单项"表格式编辑（演示）"以模态 `ShowDialog()` 打开；暂未接 EPLAN 数据。EPLAN 公共 API 无表格控件（Gui 命名空间仅 7 类型），此类界面只能用 WinForms 自行实现
 
 这是验证用骨架。业务功能成熟前，本仓库只提交基础脚手架与通用工具，核心业务逻辑公开范围由 Xinlly 决定。
 
@@ -171,4 +191,4 @@ Hello World 骨架，验证 Add-in 全链路：
 
 ---
 
-*最后更新：2026-09-09*
+*最后更新：2026-09-12*

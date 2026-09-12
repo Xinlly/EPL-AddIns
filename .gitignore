@@ -2,6 +2,9 @@
 bin/
 obj/
 
+# Add-in runtime logs
+logs/
+
 # Visual Studio
 .vs/
 *.user

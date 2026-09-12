@@ -3,6 +3,15 @@
   <PropertyGroup>
     <TargetFramework>net472</TargetFramework>
     <Nullable>enable</Nullable>
+    <UseWindowsForms>true</UseWindowsForms>
+    <!-- 构建时固化版本号：yy.M.d.HHmm（各段 <65535），EPLAN「API 模块」对话框显示此版本 -->
+    <BuildYY>$([System.DateTime]::Now.ToString('yy'))</BuildYY>
+    <BuildM>$([System.DateTime]::Now.Month)</BuildM>
+    <BuildD>$([System.DateTime]::Now.Day)</BuildD>
+    <BuildHHmm>$([System.DateTime]::Now.ToString('HHmm'))</BuildHHmm>
+    <AssemblyVersion>$(BuildYY).$(BuildM).$(BuildD).$(BuildHHmm)</AssemblyVersion>
+    <FileVersion>$(AssemblyVersion)</FileVersion>
+    <InformationalVersion>$([System.DateTime]::Now.ToString('yyyy-MM-dd-HHmm'))</InformationalVersion>
 	<LangVersion>latest</LangVersion>
 	<PlatformTarget>x64</PlatformTarget>
   </PropertyGroup>
