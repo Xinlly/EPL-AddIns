@@ -4,6 +4,7 @@ obj/
 
 # Add-in runtime logs
 logs/
+.log/
 
 # Visual Studio
 .vs/
