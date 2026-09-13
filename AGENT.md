@@ -59,16 +59,24 @@ dotnet build EPL-AddIns.slnx
 
 - 输出：`<项目>\bin\Debug\net472\<项目名>.dll`
 - 跨平台开发时可在 WSL 中调用 Windows 的 dotnet：`"/mnt/c/Program Files/dotnet/dotnet.exe" build EPL-AddIns.slnx`
+- 需要 6 分钟粒度的构建号时用统一入口 `./scripts/build.sh [Debug|Release]`（先算动态版本再编译，见下节）。
 - 重命名项目/目录后若出现怪问题，删除 `.vs/`、`bin/`、`obj/` 后重新生成。
 
 ### 程序集版本号（构建标识）
 
-- csproj 在编译时用 MSBuild 属性把 `AssemblyVersion`/`FileVersion` 固化为 **`yy.M.d.HHmm`**（如 `26.9.12.1016`），`InformationalVersion` 为 `yyyy-MM-dd-HHmm`：
-  - 四段均为数字且 <65535，符合 .NET 程序集版本限制；同一天内每分钟一次构建不会冲突
-  - 版本在**编译时**写入 DLL，重启 EPLAN 不变——不要用运行时 `DateTime.Now` 做构建标识（每次启动都变，无意义）
-- 用途：判断 EPLAN 实际加载的 DLL 是不是最新构建。打开 EPLAN 的 **API 模块（拼接软件）** 对话框，"装配名称"列显示 `EA.EplAddIn.Test, Version=26.9.12.1016, Culture=neutral, PublicKeyToken=null`；版本后四段 = 最近一次编译时间即为新 DLL
-- 插件日志 `OnInit` 也会记录程序集全名（含版本），可与对话框对照
-- 注意：版本号变化后旧注册不会自动更新，需在 Add-in/API 模块管理器中**卸载旧 DLL 再重新加载**；EPLAN 另有 ShadowCopy 缓存（`%AppData%\EPLAN\ShadowCopyAssemblies\`），怀疑加载旧缓存时先在管理器卸载、完全退出 EPLAN，再清该目录后重新加载
+规则 `major.minor.yyMM.DDHHb`，示例 `1.0.2609.13202` = v1.0 系列、2026 年 9 月、13 日 20 点、`b=floor(分/6)`（一小时 10 个 6 分钟桶，取 0~9）。前两段 `1.0` 手动维护发布系列；四段均为数字且 <65535（build 最大 `9912`、revision 最大 `31239`）。解析：`b=r%10`、`HH=(r/10)%100`、`DD=r/1000`，不依赖前导零。
+
+- **Git tag / AssemblyVersion / FileVersion / InformationalVersion 四者一致**：tag 带 `v`（`v1.0.2609.13202`），三个 .NET 字段用纯数字（`1.0.2609.13202`），InformationalVersion 带 `v`。
+- **develop 动态 / main 固化（可复现）**：
+  - develop（日常测试）：`./scripts/build.sh` 每次编译前由 `scripts/generate-dynamic-version.ps1` 按当前时间生成不入库的 `.temp/TextBatchEdit.DynamicVersion.props`（6 分钟粒度），版本随构建变，便于识别 ShadowCopy 旧 DLL。
+  - main / tag（正式发布）：入库的 `EA.EplAddIn.TextBatchEdit/release-version.props` 提供固定 `VersionBuildPart`/`VersionRevisionPart`，checkout 同一 tag 重编版本号不变。
+  - 直接用 `dotnet`/VS 编译且两种 props 都不存在时，csproj 兜底按小时粒度 `ddHH` 动态（mode=`dynamic-hour-fallback`），保证可编译。
+  - 每次构建后写 `.temp/build-version.json`（含三字段版本、buildPart/revisionPart、mode、生成时间），`.temp/` 已 gitignore。
+- 发布用 `./scripts/release-from-develop.sh [--dry-run|--no-push]`：develop 构建→读 build-version.json→merge 到 main→固化 release-version.props→Release 编译→读真实 DLL 三字段逐项校验→提交→打 annotated tag→推送。
+- 版本在**编译时**写入 DLL，重启 EPLAN 不变——不要用运行时 `DateTime.Now` 做构建标识（每次启动都变，无意义）。
+- 用途：判断 EPLAN 实际加载的 DLL 是不是最新构建。打开 EPLAN 的 **API 模块（拼接软件）** 对话框，"装配名称"列显示 `EA.EplAddIn.TextBatchEdit, Version=1.0.2609.13202, Culture=neutral, PublicKeyToken=null`。
+- 插件日志 `OnInit` 也会记录程序集全名（含版本），可与对话框对照。
+- 注意：版本号变化后旧注册不会自动更新，需在 Add-in/API 模块管理器中**卸载旧 DLL 再重新加载**；EPLAN 另有 ShadowCopy 缓存（`%AppData%\EPLAN\ShadowCopyAssemblies\`），怀疑加载旧缓存时先在管理器卸载、完全退出 EPLAN，再清该目录后重新加载。
 
 ### 协作约定（AI 协作者必守）
 
@@ -247,4 +255,4 @@ Hello World 骨架，验证 Add-in 全链路：
 
 ---
 
-*最后更新：2026-09-12*
+*最后更新：2026-09-14*

@@ -4,16 +4,41 @@
     <TargetFramework>net472</TargetFramework>
     <Nullable>enable</Nullable>
     <UseWindowsForms>true</UseWindowsForms>
-    <!-- 构建时固化版本号：yy.M.d.HHmm（各段 <65535），EPLAN「API 模块」对话框显示此版本 -->
-    <BuildYY>$([System.DateTime]::Now.ToString('yy'))</BuildYY>
-    <BuildM>$([System.DateTime]::Now.Month)</BuildM>
-    <BuildD>$([System.DateTime]::Now.Day)</BuildD>
-    <BuildHHmm>$([System.DateTime]::Now.ToString('HHmm'))</BuildHHmm>
-    <AssemblyVersion>$(BuildYY).$(BuildM).$(BuildD).$(BuildHHmm)</AssemblyVersion>
+    <LangVersion>latest</LangVersion>
+    <PlatformTarget>x64</PlatformTarget>
+    <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
+
+    <!--
+      版本规则：major.minor.yyMM.DDHHb
+      - 前两段手动维护发布系列；
+      - build=yyMM，revision=DDHHb，b=floor(minute/6)，每小时 10 个 6 分钟桶；
+      - release-version.props 入库，存在于 main/tag，固化发布版本；
+      - .temp/TextBatchEdit.DynamicVersion.props 不入库，由 scripts/build.sh 在构建前生成。
+    -->
+    <ReleaseMajor>1</ReleaseMajor>
+    <ReleaseMinor>0</ReleaseMinor>
+    <ReleaseVersionFile>$(MSBuildProjectDirectory)\release-version.props</ReleaseVersionFile>
+    <DynamicVersionFile>$(MSBuildThisFileDirectory)..\.temp\TextBatchEdit.DynamicVersion.props</DynamicVersionFile>
+    <BuildVersionRecord>$(MSBuildThisFileDirectory)..\.temp\build-version.json</BuildVersionRecord>
+  </PropertyGroup>
+
+  <!-- 固化模式优先；其次导入 build.sh 刚生成的动态版本（6 分钟粒度）。 -->
+  <Import Project="$(ReleaseVersionFile)" Condition="Exists('$(ReleaseVersionFile)')" />
+  <Import Project="$(DynamicVersionFile)" Condition="!Exists('$(ReleaseVersionFile)') And Exists('$(DynamicVersionFile)')" />
+
+  <!-- 兜底：直接用 dotnet/VS 编译且没有版本文件时，按小时粒度动态，保证可编译且不过期。 -->
+  <PropertyGroup Condition="!Exists('$(ReleaseVersionFile)') And !Exists('$(DynamicVersionFile)')">
+    <VersionBuildPart>$([System.DateTime]::Now.ToString('yyMM'))</VersionBuildPart>
+    <VersionRevisionPart>$([System.DateTime]::Now.ToString('ddHH'))</VersionRevisionPart>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <AssemblyVersion>$(ReleaseMajor).$(ReleaseMinor).$(VersionBuildPart).$(VersionRevisionPart)</AssemblyVersion>
     <FileVersion>$(AssemblyVersion)</FileVersion>
-    <InformationalVersion>$([System.DateTime]::Now.ToString('yyyy-MM-dd-HHmm'))</InformationalVersion>
-	<LangVersion>latest</LangVersion>
-	<PlatformTarget>x64</PlatformTarget>
+    <InformationalVersion>v$(AssemblyVersion)</InformationalVersion>
+    <VersionMode Condition="Exists('$(ReleaseVersionFile)')">fixed</VersionMode>
+    <VersionMode Condition="!Exists('$(ReleaseVersionFile)') And Exists('$(DynamicVersionFile)')">dynamic</VersionMode>
+    <VersionMode Condition="!Exists('$(ReleaseVersionFile)') And !Exists('$(DynamicVersionFile)')">dynamic-hour-fallback</VersionMode>
   </PropertyGroup>
 
   <ItemGroup>
@@ -38,5 +63,14 @@
       <Private>False</Private>
     </Reference>
   </ItemGroup>
+
+  <Target Name="WriteBuildVersionRecord" AfterTargets="Build">
+    <PropertyGroup>
+      <BuildVersionRecordDir>$([System.IO.Path]::GetDirectoryName('$(BuildVersionRecord)'))</BuildVersionRecordDir>
+      <BuildVersionGeneratedAt>$([System.DateTime]::Now.ToString('yyyy-MM-ddTHH:mm:sszzz'))</BuildVersionGeneratedAt>
+    </PropertyGroup>
+    <MakeDir Directories="$(BuildVersionRecordDir)" />
+    <WriteLinesToFile File="$(BuildVersionRecord)" Overwrite="true" Encoding="UTF-8" Lines='{"assemblyVersion":"$(AssemblyVersion)","fileVersion":"$(FileVersion)","informationalVersion":"$(InformationalVersion)","major":$(ReleaseMajor),"minor":$(ReleaseMinor),"buildPart":$(VersionBuildPart),"revisionPart":$(VersionRevisionPart),"configuration":"$(Configuration)","versionMode":"$(VersionMode)","generatedAt":"$(BuildVersionGeneratedAt)"}' />
+  </Target>
 
 </Project>
