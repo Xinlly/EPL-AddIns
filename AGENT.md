@@ -31,7 +31,7 @@ EPL-AddIns/
 │   ├── EA.EplAddIn.TextBatchEdit.csproj
 │   ├── TextBatchEditAddIn.cs    # IEplAddIn + 菜单
 │   ├── TextBatchEditAction.cs   # 取选择集筛 TextBase → 开窗 → 写回
-│   ├── TextBatchEditForm.cs     # 中英文表格（块复制粘贴/右键菜单）+ LockingStep 写回
+│   ├── TextBatchEditForm.cs     # 多语言表格（块复制粘贴/右键菜单/多标签页）+ UndoStep/Transaction 写回
 │   └── AddInLogger.cs           # 与 Test 同构（第三个插件时抽 Shared 项目）
 ├── references/                  # 本地引用程序集（不入库，见下）
 │   └── EplApi/*.dll             # 从 EPLAN 2.9 安装目录复制
@@ -79,7 +79,8 @@ dotnet build EPL-AddIns.slnx
 ### 日志（AddInLogger）
 
 - 文件：`AddInLogger.cs`，四级 `Debug/Info/Warn/Error`（含异常完整堆栈），按天一个文件 `addin-yyyy-MM-dd.log`
-- 位置：DLL 旁 `logs\`（即 `bin\Debug\net472\logs\`）；DLL 目录不可写时自动降级 `%TEMP%\EA.EplAddIn.Test\logs`
+- 位置（TextBatchEdit）：优先 `PathMap.SubstitutePath("$(MD_SCRIPTS)")\.log`（脚本主数据目录，与 EPL-Scripts 的 `.log` 约定一致，便于统一查看；用户在该目录建 `.log` junction/目录）；失败回退 DLL 旁 `logs\`，再失败回退 `%TEMP%\EA.EplAddIn.TextBatchEdit\logs`。每次启动 `OnInit` 会记录实际 `log dir`
+- 位置（Test 项目）：DLL 旁 `logs\`，不可写时降级 `%TEMP%\EA.EplAddIn.Test\logs`
 - 排障时看日志：时间戳 + 级别 + 线程 ID + 消息；`OnInit` 订阅了 UI 线程异常和 AppDomain 未处理异常
 - 当前为调试期默认 `MinLevel=Debug`，正式分发前改为 `Info`（未来接 App.config 的 `log4net`/`Serilog` 之前，这个轻量实现够用）
 
@@ -158,7 +159,21 @@ new Decider().Decide(
 ### 菜单
 
 `new Menu().AddMenuItem("菜单文本", "ActionName")` —— 2 参数重载，追加到"实用工具/工具"菜单末尾，在 `OnInitGui` 中调用。
-右键菜单需用 `ContextMenu` + `ContextMenuLocation`（先开 `USER.EnfMVC.ContextMenuSetting.ShowIdentifier` 查真实菜单 ID，禁止凭猜测写 ID）。
+右键菜单用 `ContextMenu` + `ContextMenuLocation`：
+- **图形编辑器（图纸页面对象）右键**：`DialogName="Editor"`、`ContextMenuName="Ged"`——两个属性分别赋值，**不能拼成 `"Editor.Ged"`**（实测可用，见 EPL-Scripts 的 ContextMenuHelloWorld）。注册：`new ContextMenu().AddMenuItem(loc, "菜单文本", "ActionName", separatorBefore, separatorBehind)`，在 `OnInitGui` 调用
+- 菜单项启用/隐藏：`IEplActionEnable.Enabled` **仅对主菜单/工具栏/Ribbon 生效；对 `Editor/Ged` 图形编辑器右键注入项 EPLAN 完全不回调（2.9 日志验证全程无调用）**，`ContextMenu` 也无置灰/隐藏属性。官方菜单项的置灰/隐藏由平台内部代码控制，未开放给第三方。第三方（DanielPa/Eplanwiki SwitchMacroVariant，同样挂 Editor/Ged）也只能常驻+点击时校验。
+- 试过且**被日志证伪**的动态时机：① 400ms 轮询（可行但被否决，性能/时序差）；② `new EventHandler("onActionEnd.String.*").NameEvent`——订阅成功，启动期有 selectionset/XGedOpenSchemePage 等内部事件，但**用户在图形编辑器里的点选/框选/右键一条 onActionEnd 都不发**（2.9 实测），不能用来跟踪选择。
+- ❌ **WinForms 消息过滤器也已实测证伪（2.9）**：物理右键确认落在 GED 画布（WindowFromPoint pid=EPLAN），右键确实弹出 MFC 菜单（出现 `Afx:...:800...` 弹出窗口类），但 `Application.AddMessageFilter` 全程零回调。根因：EPLAN 主界面是 **MFC/BCG 自己的消息循环（主窗口类 `AfxMDIFrame140u`），不是 WinForms `Application.Run`**，IMessageFilter 只在 WinForms 消息泵被查询，MFC 泵取消息时不经过它。
+- ✅ **右键项按选择显隐——最终可行方案（2.9 实测三场景全通过）**：菜单项**常驻注册一次**（`ContextMenu.AddMenuItem(Editor/Ged,...)`），在 `OnInitGui`（MFC UI 线程）用 P/Invoke 装**线程局部**钩子 `SetWindowsHookEx(WH_CALLWNDPROC=4, proc, IntPtr.Zero, GetCurrentThreadId())`：
+  - 用 `WH_CALLWNDPROC`（消息送窗口过程**之前**回调，不是 CALLWNDPROCRET），拦 `WM_INITMENU(0x0116)` 与 `WM_INITMENUPOPUP(0x0117)`，`wParam` 即本次弹出菜单的临时 HMENU。
+  - 回调里 `GetMenuItemCount` + 逐行 `GetMenuStringW(...,MF_BYPOSITION)` 按菜单文本（去 `&`）定位本插件项；查 `new SelectionSet().Selection` 是否含 `TextBase`：**不含就 `DeleteMenu(hMenu, pos, MF_BYPOSITION)` 从本次菜单删除**（删后项数立即 -1），含则不动（默认亮、可点）。只删每次弹出的临时副本，不动注册，下次弹出框架重新生成。
+  - **为什么不能置灰只能删**：GED 右键是 **BCG 自绘菜单**，它在自己的 `OnInitMenuPopup` 里把底层 HMENU 项拷成 BCG 菜单项对象，此后绘制与**命令路由都看 BCG 对象**，标准 `EnableMenuItem(MF_GRAYED)` 即使返回成功也只改了 HMENU 标志——实测视觉可能像灰但**点击照样触发命令**（曾用 CALLWNDPROCRET 置灰，被用户实测推翻）。在 BCG 处理“之前”把项从 HMENU 删掉，BCG 遍历时根本看不到该项，才真正不可点。
+  - **关键时序已验证**：右键**未预选**的文本对象时，EPLAN 在右键按下、发出 `WM_INITMENU(POPUP)` 之前就已把该对象选入选择集，故更早的 CALLWNDPROC 钩子里读到的 SelectionSet 已含该 Text（实测直接右键文本→保留），"直接右键对象"场景天然覆盖，无需轮询。
+  - 委托必须存为实例字段防 GC 回收；回调全程 try/catch 并 `CallNextHookEx` 透传（绝不吞消息/异常）；`OnExit`/`OnUnregister` 用 `UnhookWindowsHookEx` 卸载。线程钩子无需 DLL 注入、仅影响本进程 UI 线程，比全局钩子安全。
+  - 实测硬证据（看项数/存在性与点击，不看颜色）：空白右键→`DeleteMenu=True`、项数 21→20、视觉逐项确认菜单中已无该项；Ctrl+A 后右键→保留（26 项未删）；无预选直接右键文本→保留（27 项）。
+  - 注意：打开调试开关 `USER.EnfMVC.ContextMenuSetting.ShowIdentifier` 后，GED 右键菜单底部会多一个显示菜单标识的 **"Editor.Ged" 项**（只读、非插件添加），属调试显示，关掉开关即消失，别误判为插件垃圾项。
+- 双屏注意：主屏虚拟原点可能不是 (0,0)（实测上方有第二屏，虚拟 origin (0,-1080)），CUA foreground 点击用虚拟坐标，物理 SetCursorPos 用主屏坐标，两套坐标需换算；Win32 枚举窗口确认命中 pid 比坐标日志可靠。
+- 其它对话框内右键 ID（非图纸）仍需先开 `USER.EnfMVC.ContextMenuSetting.ShowIdentifier` 读取真实 DialogName/菜单 ID，禁止猜测（如文本编辑框是 `GedEditGuiText/1002`，表格编辑对话框各有不同 ID）
 
 ### 选择集与文本对象（TextBatchEdit 已核实签名）
 
