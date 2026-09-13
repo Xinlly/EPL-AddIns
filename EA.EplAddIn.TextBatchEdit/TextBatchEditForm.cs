@@ -46,6 +46,11 @@ public class TextBatchEditForm : Form
     private int _dragStartHeight;
     private const int ResizeEdge = 5; // 距单元格下边缘多少像素视为拖行高热区
 
+    // 双击列标题三级排序：None(默认原始顺序) → Asc → Desc → None
+    private int _sortCol = -1;
+    private int _sortDir; // 0=默认, 1=顺序, -1=倒序
+    private readonly List<int> _origIndex = new(); // 每个显示行对应的开窗原始下标（随排序一起重排）
+
     private const int ColIndex = 0;
     private const int ColType = 1;
     private const int ColOrigMultilang = 2;   // 原值·多语言（只读复选框）
@@ -165,6 +170,17 @@ public class TextBatchEditForm : Form
             // 不用自动换行/自动行高：换行以 ¶ 单字符单行显示（与 EPLAN 原生表编辑一致），行高保留手动调整
             ShowCellToolTips = true,
             DefaultCellStyle = new DataGridViewCellStyle { WrapMode = DataGridViewTriState.False },
+            EnableHeadersVisualStyles = false, // 允许自定义表头底色
+            ColumnHeadersHeightSizeMode = DataGridViewColumnHeadersHeightSizeMode.AutoSize, // 适配双行标题
+            GridColor = System.Drawing.Color.FromArgb(170, 170, 170), // 加深网格线，表头/数据行分界更清晰
+            ColumnHeadersDefaultCellStyle = new DataGridViewCellStyle
+            {
+                Alignment = DataGridViewContentAlignment.BottomCenter, // 标题下部居中
+                WrapMode = DataGridViewTriState.True,                  // 支持 \n 双行标题
+                BackColor = System.Drawing.Color.FromArgb(239, 239, 239), // 浅灰，比只读列(225)更浅
+                ForeColor = System.Drawing.Color.Black,
+                SelectionBackColor = System.Drawing.Color.FromArgb(239, 239, 239),
+            },
         };
 
         _grid.Columns.Add("idx", "#");
@@ -178,15 +194,15 @@ public class TextBatchEditForm : Form
         _grid.Columns[ColType].SortMode = DataGridViewColumnSortMode.NotSortable;
 
         // —— 原值侧（只读，默认随“显示原值”整体隐藏）——
-        _grid.Columns.Add(new DataGridViewCheckBoxColumn { Name = "orig_multilang", HeaderText = "原多语言", Width = 70, ReadOnly = true, Visible = false });
+        _grid.Columns.Add(new DataGridViewCheckBoxColumn { Name = "orig_multilang", HeaderText = "原值\n多语言", Width = 70, ReadOnly = true, Visible = false });
         _grid.Columns[ColOrigMultilang].SortMode = DataGridViewColumnSortMode.NotSortable;
-        _grid.Columns.Add(new DataGridViewCheckBoxColumn { Name = "orig_noAutoTrans", HeaderText = "原不自动翻译", Width = 92, ReadOnly = true, Visible = false });
+        _grid.Columns.Add(new DataGridViewCheckBoxColumn { Name = "orig_noAutoTrans", HeaderText = "原值\n不自动翻译", Width = 92, ReadOnly = true, Visible = false });
         _grid.Columns[ColOrigNoAuto].SortMode = DataGridViewColumnSortMode.NotSortable;
 
         var dnSource = LangHelper.DisplayName(_sourceLang);
 
         // —— 原值列（只读、默认隐藏，可用“显示原值”展开）——
-        _grid.Columns.Add("orig_text", "原文本（" + dnSource + "）");
+        _grid.Columns.Add("orig_text", "原值 · 源语言\n" + dnSource);
         _grid.Columns[_origTextCol].Width = 190;
         _grid.Columns[_origTextCol].ReadOnly = true;
         _grid.Columns[_origTextCol].Visible = false; // 默认隐藏，与其余原值列一致，由“显示原值”统一展开
@@ -196,7 +212,7 @@ public class TextBatchEditForm : Form
         {
             var lang = _projectLangs[i];
             var idx = OrigLangStart + i;
-            var title = "原" + LangHelper.DisplayName(lang); // 原中文 / 原英文…
+            var title = "原值\n" + LangHelper.DisplayName(lang); // 原值\n中文(中国) / 原值\n英文(美国)…
             _grid.Columns.Add("orig_" + LangHelper.Code(lang), title);
             _grid.Columns[idx].Width = 180;
             _grid.Columns[idx].ReadOnly = true;
@@ -212,7 +228,7 @@ public class TextBatchEditForm : Form
         _grid.Columns[ColNoAutoTrans].SortMode = DataGridViewColumnSortMode.NotSortable;
 
         // —— 新值列（可编辑）——
-        _grid.Columns.Add("new_text", "源语言（" + dnSource + "）");
+        _grid.Columns.Add("new_text", "源语言\n" + dnSource);
         _grid.Columns[_newTextCol].Width = 200;
         _grid.Columns[_newTextCol].SortMode = DataGridViewColumnSortMode.NotSortable;
         ((DataGridViewTextBoxColumn)_grid.Columns[_newTextCol]).CellTemplate = new LineBreakTextBoxCell();
@@ -221,7 +237,10 @@ public class TextBatchEditForm : Form
         {
             var lang = _projectLangs[i];
             var idx = NewLangStart + i;
-            var title = LangHelper.DisplayName(lang); // 中文 / 英文…
+            // 源语言语言列与“源语言文本列”双向同步，两列标题同名
+            var title = lang == _sourceLang
+                ? "源语言\n" + dnSource
+                : LangHelper.DisplayName(lang); // 中文(中国) / 英文(美国)…
             _grid.Columns.Add("new_" + LangHelper.Code(lang), title);
             _grid.Columns[idx].Width = 200;
             _grid.Columns[idx].SortMode = DataGridViewColumnSortMode.NotSortable;
@@ -275,6 +294,7 @@ public class TextBatchEditForm : Form
         _grid.ContextMenuStrip = menu;
 
         _grid.KeyDown += GridOnKeyDown;
+        _grid.ColumnHeaderMouseDoubleClick += GridOnHeaderDoubleClick; // 双击表头：顺序/倒序/默认
         _grid.CellMouseClick += GridOnCellMouseClick;
         _grid.CellFormatting += GridOnCellFormatting; // 统一单元格状态着色
         // 任意单元格下边缘拖拽调行高
@@ -370,6 +390,7 @@ public class TextBatchEditForm : Form
                 "【换行与排版】\n" +
                 "  • 单元格里按 Ctrl+Enter 换行（显示为 ¶，保存后即为真正换行）；也可右键选“换行”。\n" +
                 "  • 拖动格子下边缘可改该行高度，拖动表头分隔线可改列宽；右键“调整列宽”自动适配。\n" +
+                "  • 双击任意列标题可按该列排序：正序 → 倒序 → 恢复原顺序。\n" +
                 "  • 可像 Excel 一样框选后复制、粘贴、删除。\n\n" +
                 "【格子颜色】\n" +
                 "  • 灰色：只读，不能修改。\n" +
@@ -628,6 +649,8 @@ public class TextBatchEditForm : Form
         var unknown = ISOCode.Language.L___;
 
         _baseline.Clear();
+        _initial.Clear();
+        _origIndex.Clear();
         _syncing = true;
         _grid.Rows.Clear();
         try
@@ -723,12 +746,134 @@ public class TextBatchEditForm : Form
                 var snap = SnapshotRow(rowIdx);
                 _baseline.Add(snap);
                 _initial.Add(CloneRow(snap));
+                _origIndex.Add(i);
             }
         }
         finally
         {
             _syncing = false;
         }
+    }
+
+    // —— 双击列标题：顺序 → 倒序 → 默认（恢复开窗原始顺序）——
+    private void GridOnHeaderDoubleClick(object? sender, DataGridViewCellMouseEventArgs e)
+    {
+        if (e.ColumnIndex < 0) { return; }
+        // 三级循环：同列 1(升) → -1(降) → 0(默认)；换新列则从升序开始
+        if (e.ColumnIndex == _sortCol && _sortDir != 0) { _sortDir = _sortDir == 1 ? -1 : 0; }
+        else { _sortCol = e.ColumnIndex; _sortDir = 1; }
+        if (_sortDir == 0) { _sortCol = -1; }
+        ApplySort(e.ColumnIndex, _sortDir);
+    }
+
+    private sealed class SortView
+    {
+        public object?[] Values = null!;
+        public int Height;
+        public TextBase T = null!;
+        public RowState Base = null!;
+        public RowState Init = null!;
+        public int Orig;
+    }
+
+    private void ApplySort(int col, int dir)
+    {
+        if (_grid.IsCurrentCellInEditMode) { _grid.EndEdit(); }
+        var n = _grid.Rows.Count;
+        if (n == 0) { return; }
+
+        var colCount = _grid.Columns.Count;
+        var views = new List<SortView>(n);
+        for (var i = 0; i < n; i++)
+        {
+            var vals = new object?[colCount];
+            for (var c = 0; c < colCount; c++) { vals[c] = _grid[c, i].Value; }
+            views.Add(new SortView
+            {
+                Values = vals,
+                Height = _grid.Rows[i].Height,
+                T = _texts[i],
+                Base = _baseline[i],
+                Init = _initial[i],
+                Orig = _origIndex[i],
+            });
+        }
+
+        // 稳定排序：dir=0 按开窗原始下标恢复；升/降按该列值（复选框按布尔、其余按文本）
+        IEnumerable<SortView> q = views;
+        if (dir == 0)
+        {
+            q = views.OrderBy(v => v.Orig);
+        }
+        else
+        {
+            var isCheck = _grid.Columns[col] is DataGridViewCheckBoxColumn;
+            if (col == ColIndex)
+            {
+                int Num(SortView v) => int.TryParse(v.Values[col] as string, out var x) ? x : 0;
+                q = dir > 0 ? views.OrderBy(Num).ThenBy(v => v.Orig)
+                             : views.OrderByDescending(Num).ThenBy(v => v.Orig);
+            }
+            else if (isCheck)
+            {
+                q = dir > 0
+                    ? views.OrderBy(v => Convert.ToBoolean(v.Values[col] ?? false) ? 1 : 0).ThenBy(v => v.Orig)
+                    : views.OrderByDescending(v => Convert.ToBoolean(v.Values[col] ?? false) ? 1 : 0).ThenBy(v => v.Orig);
+            }
+            else
+            {
+                q = dir > 0
+                    ? views.OrderBy(v => (v.Values[col] as string) ?? string.Empty).ThenBy(v => v.Orig)
+                    : views.OrderByDescending(v => (v.Values[col] as string) ?? string.Empty).ThenBy(v => v.Orig);
+            }
+        }
+        var sorted = q.ToList();
+
+        // 同步重排四个并行列表（显示行 i 始终对应 _texts[i]，写回/着色逻辑不变）
+        for (var i = 0; i < n; i++)
+        {
+            _texts[i] = sorted[i].T;
+            _baseline[i] = sorted[i].Base;
+            _initial[i] = sorted[i].Init;
+            _origIndex[i] = sorted[i].Orig;
+        }
+
+        // 重建网格行（带回原值与手调行高）
+        _syncing = true;
+        try
+        {
+            _grid.Rows.Clear();
+            foreach (var v in sorted)
+            {
+                var ri = _grid.Rows.Add();
+                var row = _grid.Rows[ri];
+                for (var c = 0; c < colCount; c++) { row.Cells[c].Value = v.Values[c]; }
+                row.Height = v.Height;
+                SetRowEditable(ri, Convert.ToBoolean(v.Values[ColMultilang] ?? false));
+            }
+        }
+        finally
+        {
+            _syncing = false;
+        }
+
+        // 列头排序箭头（Programmatic：只显示箭头，不触发系统排序）
+        foreach (DataGridViewColumn c in _grid.Columns)
+        {
+            if (c.SortMode != DataGridViewColumnSortMode.NotSortable)
+            {
+                c.HeaderCell.SortGlyphDirection = SortOrder.None;
+            }
+        }
+        if (dir != 0)
+        {
+            var gc = _grid.Columns[col];
+            gc.SortMode = DataGridViewColumnSortMode.Programmatic;
+            gc.HeaderCell.SortGlyphDirection = dir > 0 ? SortOrder.Ascending : SortOrder.Descending;
+        }
+
+        UpdateApplyEnabled();
+        AddInLogger.Debug("排序：列=" + col + " 方向=" + (dir == 0 ? "默认" : dir > 0 ? "升序" : "降序"));
     }
 
     /// <summary>抓取该行当前可写状态（标志 + 各可编辑语言值）作为已保存基线。源语言内容以“中文列”为准（与文本列同步）。</summary>
