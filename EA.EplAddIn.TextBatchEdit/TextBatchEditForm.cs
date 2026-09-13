@@ -35,6 +35,26 @@ public class TextBatchEditForm : Form
     private const int ColMultilang = 2;   // “多语言”复选框
     private const int ColNoAutoTrans = 3; // “不自动翻译”复选框（勾选=IsAutomaticallyTranslated=false）
     private const int OrigTextCol = 4;    // 原值·文本列
+
+    // 换行表示（对齐 EPLAN 原生表编辑）：界面/表格内一律用 ¶ 单字符单行显示；
+    // 写回 EPLAN 时替换为真正换行符，读取时再还原为 ¶。
+    private const string LineMarker = "¶";
+    private const string LineBreak = "\n";
+
+    /// <summary>EPLAN 真实换行（\r\n / \r / \n）→ 表格显示用 ¶。</summary>
+    private static string ToGrid(string s)
+    {
+        if (string.IsNullOrEmpty(s)) { return string.Empty; }
+        return s.Replace("\r\n", LineBreak).Replace('\r', '\n').Replace(LineBreak, LineMarker);
+    }
+
+    /// <summary>表格显示用 ¶ → EPLAN 真实换行。</summary>
+    private static string ToEplan(string s)
+    {
+        if (string.IsNullOrEmpty(s)) { return string.Empty; }
+        return s.Replace(LineMarker, LineBreak);
+    }
+
     private int OrigLangStart => 5;                          // 原值·语言列起点
     private int NewTextColIdx => OrigLangStart + _projectLangs.Count;        // 新值·文本列
     private int NewLangStart => NewTextColIdx + 1;                           // 新值·语言列起点
@@ -61,8 +81,12 @@ public class TextBatchEditForm : Form
         BuildBottomBar();
         LoadRows();
         UpdateApplyEnabled();
-        // 窗体真正显示（grid 句柄已建）后，再按复选框状态同步一次，确保原值列默认隐藏
-        Shown += (_, _) => SetOrigColumnsVisible(_showOrigChk.Checked);
+        // 窗体真正显示（grid 句柄已建）后：按复选框同步原值列可见性，并自动调整一次列宽
+        Shown += (_, _) =>
+        {
+            SetOrigColumnsVisible(_showOrigChk.Checked);
+            AutoFitColumns();
+        };
     }
 
     private void BuildGrid()
@@ -75,9 +99,14 @@ public class TextBatchEditForm : Form
             AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.None,
             SelectionMode = DataGridViewSelectionMode.CellSelect,
             MultiSelect = true,
-            RowHeadersVisible = false,
+            RowHeadersVisible = true,   // 显示窄行首列，供拖拽调整行高（兼作行选择）
+            RowHeadersWidth = 22,
+            AllowUserToResizeRows = true,
             BackgroundColor = System.Drawing.Color.White,
             ClipboardCopyMode = DataGridViewClipboardCopyMode.EnableWithoutHeaderText,
+            // 不用自动换行/自动行高：换行以 ¶ 单字符单行显示（与 EPLAN 原生表编辑一致），行高保留手动调整
+            ShowCellToolTips = true,
+            DefaultCellStyle = new DataGridViewCellStyle { WrapMode = DataGridViewTriState.False },
         };
 
         _grid.Columns.Add("idx", "#");
@@ -124,6 +153,7 @@ public class TextBatchEditForm : Form
         _grid.Columns.Add("new_text", "源语言（" + dnSource + "）");
         _grid.Columns[_newTextCol].Width = 200;
         _grid.Columns[_newTextCol].SortMode = DataGridViewColumnSortMode.NotSortable;
+        ((DataGridViewTextBoxColumn)_grid.Columns[_newTextCol]).CellTemplate = new LineBreakTextBoxCell();
 
         for (var i = 0; i < _projectLangs.Count; i++)
         {
@@ -133,6 +163,7 @@ public class TextBatchEditForm : Form
             _grid.Columns.Add("new_" + LangHelper.Code(lang), title);
             _grid.Columns[idx].Width = 200;
             _grid.Columns[idx].SortMode = DataGridViewColumnSortMode.NotSortable;
+            ((DataGridViewTextBoxColumn)_grid.Columns[idx]).CellTemplate = new LineBreakTextBoxCell();
             _newLangCol[lang] = idx;
         }
 
@@ -176,6 +207,8 @@ public class TextBatchEditForm : Form
         menu.Items.Add("剪切(&X)", null, (_, _) => CutSelection());
         menu.Items.Add("粘贴(&V)", null, (_, _) => PasteClipboard());
         menu.Items.Add("清除内容(&D)", null, (_, _) => ClearSelection());
+        menu.Items.Add(new ToolStripSeparator());
+        menu.Items.Add("调整列宽(&A)", null, (_, _) => AutoFitColumns());
         _grid.ContextMenuStrip = menu;
 
         _grid.KeyDown += GridOnKeyDown;
@@ -249,7 +282,10 @@ public class TextBatchEditForm : Form
                 "  • 取消：放弃未保存修改并关闭。\n" +
                 "  • 每次“应用/确定”若确有改动，整批合并为一个撤销点，可在 EPLAN 中 Ctrl+Z 一次撤销。\n\n" +
                 "【编辑操作】\n" +
-                "  • 框选多格后 Ctrl+C / Ctrl+X / Ctrl+V 块复制粘贴（Tab 分列、换行分行，可与 Excel 互贴），Delete 清除。",
+                "  • 单元格内按 Ctrl+Enter 插入换行标记 ¶（写回时替换为真正换行，与 EPLAN 原生表编辑一致）；普通 Enter 提交当前格。\n" +
+                "  • 表格内换行一律显示为 ¶（单行显示）；超长未换行文本会在单元格内截断，鼠标悬停可看全文，或拉宽列/双击编辑查看。\n" +
+                "  • 可拖动行首分隔线手动调整行高、拖动列分隔线调整列宽；右键“调整列宽”可按内容自适应。\n" +
+                "  • 框选多格后 Ctrl+C / Ctrl+X / Ctrl+V 复制粘贴，遵循 Excel 规则（Tab 分列、行换行分行、双引号内的换行属于同一单元格，可与 Excel 互贴），Delete 清除。",
         };
         tabHelp.Controls.Add(help);
 
@@ -262,6 +298,25 @@ public class TextBatchEditForm : Form
     {
         _grid.Columns[_origTextCol].Visible = visible;
         foreach (var idx in _origLangCol.Values) { _grid.Columns[idx].Visible = visible; }
+        if (visible) { AutoFitColumns(); }
+    }
+
+    /// <summary>
+    /// 按当前单元格内容自动调整各可见列宽（含表头），并限制在 60~420px，避免多行长文本把列撑爆。
+    /// </summary>
+    private void AutoFitColumns()
+    {
+        const int minW = 60, maxW = 420;
+        foreach (DataGridViewColumn col in _grid.Columns)
+        {
+            if (!col.Visible) { continue; }
+            _grid.AutoResizeColumn(col.Index, DataGridViewAutoSizeColumnMode.AllCells);
+            var w = col.Width;
+            if (w < minW) { w = minW; }
+            if (w > maxW) { w = maxW; }
+            col.Width = w;
+        }
+        AddInLogger.Debug("AutoFitColumns 完成");
     }
 
     /// <summary>
@@ -399,6 +454,7 @@ public class TextBatchEditForm : Form
                 var srcVal = isTranslated
                     ? (values.TryGetValue(_sourceLang, out var sval) ? sval : string.Empty)
                     : mirrorVal;
+                srcVal = ToGrid(srcVal); // 真实换行 → ¶，单元格单行显示
 
                 // 文本列与源语言列同值（原值 / 新值两侧都同步）
                 row.Cells[_origTextCol].Value = srcVal;
@@ -410,8 +466,9 @@ public class TextBatchEditForm : Form
                 {
                     if (lang == _sourceLang) { continue; }
                     var v = isTranslated && values.TryGetValue(lang, out var x) ? x : string.Empty;
-                    row.Cells[_origLangCol[lang]].Value = v;
-                    row.Cells[_newLangCol[lang]].Value = v;
+                    var gv = ToGrid(v);
+                    row.Cells[_origLangCol[lang]].Value = gv;
+                    row.Cells[_newLangCol[lang]].Value = gv;
                 }
 
                 SetRowEditable(rowIdx, isTranslated);
@@ -505,9 +562,30 @@ public class TextBatchEditForm : Form
     {
         var cells = _grid.SelectedCells.Cast<DataGridViewCell>().Where(c => c.RowIndex >= 0).ToList();
         if (cells.Count == 0) { return; }
-        var content = _grid.GetClipboardContent();
-        if (content == null) { AddInLogger.Warn("CopySelection: GetClipboardContent 返回 null"); return; }
-        Clipboard.SetDataObject(content);
+        // 按选区矩形自建 TSV：含换行(¶)的单元格转成真实换行并用双引号包裹，符合 Excel 复制格式
+        var minRow = cells.Min(c => c.RowIndex);
+        var maxRow = cells.Max(c => c.RowIndex);
+        var minCol = cells.Min(c => c.ColumnIndex);
+        var maxCol = cells.Max(c => c.ColumnIndex);
+        var sb = new System.Text.StringBuilder();
+        for (var r = minRow; r <= maxRow; r++)
+        {
+            for (var c = minCol; c <= maxCol; c++)
+            {
+                if (c > minCol) { sb.Append('\t'); }
+                var raw = ToEplan(_grid[c, r].FormattedValue?.ToString() ?? string.Empty); // ¶ → 真实换行
+                sb.Append(QuoteTsv(raw));
+            }
+            if (r < maxRow) { sb.Append("\r\n"); }
+        }
+        Clipboard.SetText(sb.ToString());
+    }
+
+    /// <summary>按 Excel 规则引用字段：含 Tab/换行/引号时用双引号包裹，内部引号双写。</summary>
+    private static string QuoteTsv(string s)
+    {
+        if (s.IndexOfAny(new[] { '\t', '\r', '\n', '"' }) < 0) { return s; }
+        return "\"" + s.Replace("\"", "\"\"") + "\"";
     }
 
     private void CutSelection()
@@ -542,25 +620,81 @@ public class TextBatchEditForm : Form
         var anchor = SelectionAnchorCell();
         if (anchor == null) { return; }
 
-        var lines = text!.Replace("\r\n", "\n").TrimEnd('\n').Split('\n');
+        // 按 Excel/TSV 语义解析：引号内的 Tab/换行属于“单元格内”内容，不拆列/拆行。
+        var rows = ParseTsv(text!);
         var pasted = 0;
-        for (var r = 0; r < lines.Length; r++)
+        for (var r = 0; r < rows.Count; r++)
         {
             var rowIdx = anchor.RowIndex + r;
             if (rowIdx >= _grid.Rows.Count) { break; }
-            var fields = lines[r].Split('\t');
-            for (var c = 0; c < fields.Length; c++)
+            var fields = rows[r];
+            for (var c = 0; c < fields.Count; c++)
             {
                 var colIdx = anchor.ColumnIndex + c;
                 if (!IsNewValueCol(colIdx)) { continue; }
                 var cell = _grid[colIdx, rowIdx];
                 if (cell.ReadOnly) { continue; }
-                cell.Value = fields[c];
+                cell.Value = ToGrid(fields[c]); // 格内真实换行 → ¶，不产生新表行
                 pasted++;
             }
         }
         UpdateApplyEnabled();
-        AddInLogger.Debug("Paste: 写入 " + pasted + " 格");
+        AddInLogger.Debug("Paste: 写入 " + pasted + " 格（" + rows.Count + " 行）");
+    }
+
+    /// <summary>
+    /// 解析 Excel 风格 TSV：Tab 分列、CRLF/LF 分行；被双引号包裹的单元格内，Tab/换行均为格内内容，
+    /// “”“”转义为一个引号。无引号文本按普通 Tab/换行拆分（兼容记事本等来源）。
+    /// </summary>
+    private static List<List<string>> ParseTsv(string text)
+    {
+        var rows = new List<List<string>>();
+        var row = new List<string>();
+        var field = new System.Text.StringBuilder();
+        var inQuotes = false;
+        var anyQuote = false;
+        for (var i = 0; i < text.Length; i++)
+        {
+            var ch = text[i];
+            if (inQuotes)
+            {
+                if (ch == '"')
+                {
+                    if (i + 1 < text.Length && text[i + 1] == '"') { field.Append('"'); i++; }
+                    else { inQuotes = false; }
+                }
+                else { field.Append(ch); }
+                continue;
+            }
+            if (ch == '"' && field.Length == 0) { inQuotes = true; anyQuote = true; }
+            else if (ch == '\t') { row.Add(field.ToString()); field.Clear(); anyQuote = false; }
+            else if (ch == '\n')
+            {
+                row.Add(field.ToString()); field.Clear(); anyQuote = false;
+                rows.Add(row); row = new List<string>();
+                if (i + 1 < text.Length && text[i + 1] == '\n') { /* 罕见：连续换行视为空行 */ }
+            }
+            else if (ch == '\r')
+            {
+                // 可能是 CRLF 或单独 CR
+                row.Add(field.ToString()); field.Clear(); anyQuote = false;
+                rows.Add(row); row = new List<string>();
+                if (i + 1 < text.Length && text[i + 1] == '\n') { i++; }
+            }
+            else { field.Append(ch); }
+        }
+        // 末尾最后一格/最后一行
+        if (field.Length > 0 || row.Count > 0 || anyQuote)
+        {
+            row.Add(field.ToString());
+            rows.Add(row);
+        }
+        // 去掉因尾部换行产生的空行
+        while (rows.Count > 0 && rows[rows.Count - 1].Count == 1 && rows[rows.Count - 1][0].Length == 0)
+        {
+            rows.RemoveAt(rows.Count - 1);
+        }
+        return rows;
     }
 
     private DataGridViewCell? SelectionAnchorCell()
@@ -648,7 +782,7 @@ public class TextBatchEditForm : Form
                 if (contentChanged)
                 {
                     var mls = new MultiLangString();
-                    foreach (var kv in expected) { mls.AddString(kv.Key, kv.Value); }
+                    foreach (var kv in expected) { mls.AddString(kv.Key, ToEplan(kv.Value)); } // ¶ → 真实换行
                     t.Contents = mls; // 必须经 setter 赋回才落库
                 }
                 if (flagChanged)
@@ -693,7 +827,7 @@ public class TextBatchEditForm : Form
                     foreach (var lang in _projectLangs)
                     {
                         var want = _grid[_newLangCol[lang], i].Value as string ?? string.Empty;
-                        var actual = ReadSafe(c, lang);
+                        var actual = ToGrid(ReadSafe(c, lang)); // 真实换行 → ¶ 再比对
                         if (!string.Equals(want, actual, StringComparison.Ordinal))
                         {
                             rowOk = false;
@@ -704,10 +838,10 @@ public class TextBatchEditForm : Form
                 }
                 else
                 {
-                    var actual = PickClean(
+                    var actual = ToGrid(PickClean(
                         Safe(() => c.GetStringToDisplay(_sourceLang)),
                         Safe(() => c.GetString(unknown)),
-                        c.InternalString ?? string.Empty);
+                        c.InternalString ?? string.Empty));
                     if (!string.Equals(mirrorVal, actual, StringComparison.Ordinal))
                     {
                         rowOk = false;
@@ -805,5 +939,44 @@ public class TextBatchEditForm : Form
     private class BufferedPanel : Panel
     {
         public BufferedPanel() { DoubleBuffered = true; }
+    }
+
+    /// <summary>
+    /// 文本编辑控件：声明自己要消费 Ctrl+Enter，避免按键被 DataGridView 提前解释为“结束编辑”；
+    /// 在 OnKeyDown 中插入换行标记 ¶（写回时再替换为真实换行）。普通 Enter 仍交给表格提交/下移。
+    /// </summary>
+    internal class LineBreakTextBox : DataGridViewTextBoxEditingControl
+    {
+        private const string Marker = "¶";
+
+        public override bool EditingControlWantsInputKey(Keys keyData, bool dataGridViewWantsInputKey)
+        {
+            if ((keyData & Keys.KeyCode) == Keys.Enter && (keyData & Keys.Control) != 0)
+            {
+                return true; // 自己消费 Ctrl+Enter
+            }
+            return base.EditingControlWantsInputKey(keyData, dataGridViewWantsInputKey);
+        }
+
+        protected override void OnKeyDown(KeyEventArgs e)
+        {
+            if (e.Control && e.KeyCode == Keys.Enter)
+            {
+                var caret = SelectionStart;
+                var sel = SelectionLength;
+                Text = Text.Remove(caret, sel).Insert(caret, Marker);
+                SelectionStart = caret + Marker.Length;
+                SelectionLength = 0;
+                e.Handled = true;
+                e.SuppressKeyPress = true;
+                return;
+            }
+            base.OnKeyDown(e);
+        }
+    }
+
+    internal class LineBreakTextBoxCell : DataGridViewTextBoxCell
+    {
+        public override Type EditType => typeof(LineBreakTextBox);
     }
 }
