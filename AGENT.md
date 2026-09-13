@@ -99,7 +99,7 @@ dotnet build EPL-AddIns.slnx
 - **已废弃的邮箱**：`dora@noreply.local`（不归属任何账号、不计贡献）；`dora@users.noreply.github.com`（无数字 ID 的旧格式，会错误归属到真实第三方账号 github.com/dora，id 149025，严禁再用）；真实邮箱 `Xinlly@outlook.com`（隐私原因不再用于提交）。
 - 实现方式：不改仓库 git config；Dora 代提交用当次环境变量 `GIT_AUTHOR_NAME=Dora GIT_AUTHOR_EMAIL=<noreply>`、`GIT_COMMITTER_NAME/EMAIL` 同名同邮箱，不影响用户手动提交。
 - 推送认证始终使用 Xinlly 的 GitHub token（pusher=Xinlly，与作者独立）；WSL 侧推送走 `https_proxy=http://127.0.0.1:35353`，token 不写入 remote 配置。
-- 重写历史用 `--force-with-lease`；推送到显式 URL 时需写成 `--force-with-lease=main:<远端当前sha>`，否则 lease 校验找不到跟踪引用。本仓库历史曾于 2026-09-13 整体改写：11 条 Dora 提交邮箱由 `dora@noreply.local` 改为上述 ID 型 noreply（name 保持 Dora），SHA 全部变化，用户首提交 `510d907` 保持不变；改写前备份分支 `backup/pre-noreply-20260913` 保留数日。
+- 重写历史用 `--force-with-lease`；推送到显式 URL 时需写成 `--force-with-lease=main:<远端当前sha>`，否则 lease 校验找不到跟踪引用。本仓库历史曾于 2026-09-13 整体改写：11 条 Dora 提交邮箱由 `dora@noreply.local` 改为上述 ID 型 noreply（name 保持 Dora），SHA 全部变化，用户首提交 `510d907` 保持不变；改写前曾建备份分支 `backup/pre-noreply-20260913`，确认无误后已于 2026-09-14 删除。
 
 ---
 
