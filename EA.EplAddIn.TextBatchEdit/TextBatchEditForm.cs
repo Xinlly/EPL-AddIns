@@ -297,6 +297,7 @@ public class TextBatchEditForm : Form
         _grid.ColumnHeaderMouseDoubleClick += GridOnHeaderDoubleClick; // 双击表头：顺序/倒序/默认
         _grid.CellMouseClick += GridOnCellMouseClick;
         _grid.CellFormatting += GridOnCellFormatting; // 统一单元格状态着色
+        _grid.CellPainting += GridOnCellPainting;     // 自绘列头排序箭头
         // 任意单元格下边缘拖拽调行高
         _grid.MouseDown += GridOnMouseDownForRowResize;
         _grid.MouseMove += GridOnMouseMoveForRowResize;
@@ -435,21 +436,51 @@ public class TextBatchEditForm : Form
     }
 
     /// <summary>
-    /// 按当前单元格内容自动调整各可见列宽（含表头），并限制在 60~420px，避免多行长文本把列撑爆。
+    /// 自动列宽：宽度取“数据内容”与“表头最长一行（多行标题按最长行算）”的较大者，
+    /// 再统一为排序箭头预留右侧空间；限制在 60~420px。
     /// </summary>
     private void AutoFitColumns()
     {
         const int minW = 60, maxW = 420;
+        const int pad = 12;          // 文字左右内边距合计
+        const int arrowReserve = 20; // 给列标题排序箭头预留的右侧宽度
+        var flags = TextFormatFlags.SingleLine | TextFormatFlags.Left | TextFormatFlags.NoPadding;
+
+        using var g = _grid.CreateGraphics();
+        var cellFont = _grid.Font;
+        var headFont = _grid.ColumnHeadersDefaultCellStyle.Font ?? _grid.Font;
+
         foreach (DataGridViewColumn col in _grid.Columns)
         {
             if (!col.Visible) { continue; }
-            _grid.AutoResizeColumn(col.Index, DataGridViewAutoSizeColumnMode.AllCells);
-            var w = col.Width;
-            if (w < minW) { w = minW; }
-            if (w > maxW) { w = maxW; }
-            col.Width = w;
+            var best = 0;
+
+            // 表头：多行标题按最长一行计宽
+            foreach (var line in (col.HeaderText ?? string.Empty).Split('\n'))
+            {
+                best = Math.Max(best, TextRenderer.MeasureText(g, line, headFont, Size.Empty, flags).Width);
+            }
+
+            if (col is DataGridViewCheckBoxColumn)
+            {
+                best = Math.Max(best, 18); // 复选框本体占位
+            }
+
+            // 数据单元格内容（¶ 单行显示，不换行）
+            foreach (DataGridViewRow row in _grid.Rows)
+            {
+                var s = row.Cells[col.Index].Value?.ToString();
+                if (string.IsNullOrEmpty(s)) { continue; }
+                foreach (var line in s!.Split('\n'))
+                {
+                    best = Math.Max(best, TextRenderer.MeasureText(g, line, cellFont, Size.Empty, flags).Width);
+                }
+            }
+
+            var w = best + pad + arrowReserve;
+            col.Width = Math.Max(minW, Math.Min(maxW, w));
         }
-        AddInLogger.Debug("AutoFitColumns 完成");
+        AddInLogger.Debug("AutoFitColumns 完成（含表头最长行 + 排序箭头余量）");
     }
 
     /// <summary>
@@ -518,6 +549,47 @@ public class TextBatchEditForm : Form
     private bool IsOrigCol(int col) =>
         col == ColOrigMultilang || col == ColOrigNoAuto ||
         col == _origTextCol || _origLangCol.ContainsValue(col);
+
+    // —— 自绘列头排序箭头：默认渲染后，在当前排序列表头右侧叠一个实心三角（系统 glyph 在自定义样式下会渲染成斜杠）——
+    private void GridOnCellPainting(object? sender, DataGridViewCellPaintingEventArgs e)
+    {
+        // 只处理“列头”且“当前排序列”
+        if (e.RowIndex != -1 || _sortDir == 0 || e.ColumnIndex != _sortCol) { return; }
+
+        // 先让系统照常绘制背景/边框/文字（文字已下部居中），再叠加箭头
+        e.Paint(e.ClipBounds, DataGridViewPaintParts.All);
+
+        const int aw = 9, ah = 7;
+        var right = e.CellBounds.Right - 11;
+        var top = e.CellBounds.Top + (e.CellBounds.Height - ah) / 2;
+
+        Point[] pts;
+        if (_sortDir > 0)
+        {
+            // 向上三角：顶点在上
+            pts = new[]
+            {
+                new Point(right - aw / 2, top),          // 顶点
+                new Point(right, top + ah),              // 右下
+                new Point(right - aw, top + ah),         // 左下
+            };
+        }
+        else
+        {
+            // 向下三角：顶点在下
+            pts = new[]
+            {
+                new Point(right - aw, top),              // 左上
+                new Point(right, top),                   // 右上
+                new Point(right - aw / 2, top + ah),     // 底点
+            };
+        }
+
+        using var b = new SolidBrush(System.Drawing.Color.FromArgb(70, 70, 70));
+        e.Graphics.FillPolygon(b, pts);
+
+        e.Handled = true;
+    }
 
     private int CorrespondingNewCol(int origCol)
     {
@@ -857,20 +929,9 @@ public class TextBatchEditForm : Form
             _syncing = false;
         }
 
-        // 列头排序箭头（Programmatic：只显示箭头，不触发系统排序）
-        foreach (DataGridViewColumn c in _grid.Columns)
-        {
-            if (c.SortMode != DataGridViewColumnSortMode.NotSortable)
-            {
-                c.HeaderCell.SortGlyphDirection = SortOrder.None;
-            }
-        }
-        if (dir != 0)
-        {
-            var gc = _grid.Columns[col];
-            gc.SortMode = DataGridViewColumnSortMode.Programmatic;
-            gc.HeaderCell.SortGlyphDirection = dir > 0 ? SortOrder.Ascending : SortOrder.Descending;
-        }
+        // 触发列头重绘，由 CellPainting 自绘实心排序箭头（不用系统 glyph，避免渲染成斜杠）
+        _grid.Invalidate(_grid.DisplayRectangle);
+        _grid.Refresh();
 
         UpdateApplyEnabled();
         AddInLogger.Debug("排序：列=" + col + " 方向=" + (dir == 0 ? "默认" : dir > 0 ? "升序" : "降序"));
