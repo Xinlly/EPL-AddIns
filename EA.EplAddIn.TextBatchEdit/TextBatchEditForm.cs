@@ -29,12 +29,20 @@ public class TextBatchEditForm : Form
     private Button _okBtn = null!;
     private Button _cancelBtn = null!;
     private Button _applyBtn = null!;
+    private CtrlEnterFilter? _keyFilter;
 
     private const int ColIndex = 0;
     private const int ColType = 1;
-    private const int ColMultilang = 2;   // “多语言”复选框
-    private const int ColNoAutoTrans = 3; // “不自动翻译”复选框（勾选=IsAutomaticallyTranslated=false）
-    private const int OrigTextCol = 4;    // 原值·文本列
+    private const int ColOrigMultilang = 2;   // 原值·多语言（只读复选框）
+    private const int ColOrigNoAuto = 3;      // 原值·不自动翻译（只读复选框）
+    private const int OrigTextCol = 4;        // 原值·文本列
+
+    private const int OrigLangStart = 5;      // 原值·语言列起点
+    private int NewCheckStart => OrigLangStart + _projectLangs.Count;       // 新值复选框起点
+    private int ColMultilang => NewCheckStart;      // 新值·多语言（可编辑）
+    private int ColNoAutoTrans => NewCheckStart + 1; // 新值·不自动翻译（可编辑）
+    private int NewTextColIdx => NewCheckStart + 2;  // 新值·文本列
+    private int NewLangStart => NewTextColIdx + 1;   // 新值·语言列起点
 
     // 换行表示（对齐 EPLAN 原生表编辑）：界面/表格内一律用 ¶ 单字符单行显示；
     // 写回 EPLAN 时替换为真正换行符，读取时再还原为 ¶。
@@ -54,10 +62,6 @@ public class TextBatchEditForm : Form
         if (string.IsNullOrEmpty(s)) { return string.Empty; }
         return s.Replace(LineMarker, LineBreak);
     }
-
-    private int OrigLangStart => 5;                          // 原值·语言列起点
-    private int NewTextColIdx => OrigLangStart + _projectLangs.Count;        // 新值·文本列
-    private int NewLangStart => NewTextColIdx + 1;                           // 新值·语言列起点
 
     private bool _syncing; // 程序化填充/双向同步时抑制事件联动
 
@@ -81,12 +85,55 @@ public class TextBatchEditForm : Form
         BuildBottomBar();
         LoadRows();
         UpdateApplyEnabled();
+        // 应用层消息过滤器：在消息派发前吞掉编辑态的 Ctrl+Enter，防止被 DataGridView 当成“结束编辑”
+        _keyFilter = new CtrlEnterFilter(this);
+        Application.AddMessageFilter(_keyFilter);
         // 窗体真正显示（grid 句柄已建）后：按复选框同步原值列可见性，并自动调整一次列宽
         Shown += (_, _) =>
         {
             SetOrigColumnsVisible(_showOrigChk.Checked);
             AutoFitColumns();
         };
+    }
+
+    protected override void OnFormClosed(FormClosedEventArgs e)
+    {
+        if (_keyFilter != null) { Application.RemoveMessageFilter(_keyFilter); _keyFilter = null; }
+        base.OnFormClosed(e);
+    }
+
+    /// <summary>由消息过滤器调用：当前正编辑单元格时，在其中插入换行标记 ¶（不退出编辑态）。</summary>
+    private bool TryInsertLineBreakAtEditing()
+    {
+        if (_grid == null || !_grid.IsCurrentCellInEditMode) { return false; }
+        if (_grid.EditingControl is not TextBox tb || tb.IsDisposed) { return false; }
+        var caret = tb.SelectionStart;
+        var sel = tb.SelectionLength;
+        tb.Text = tb.Text.Remove(caret, sel).Insert(caret, LineMarker);
+        tb.SelectionStart = caret + LineMarker.Length;
+        tb.SelectionLength = 0;
+        if (_applyBtn is { Enabled: false }) { _applyBtn.Enabled = true; }
+        return true;
+    }
+
+    private sealed class CtrlEnterFilter : IMessageFilter
+    {
+        private const int WM_KEYDOWN = 0x0100;
+        private const int VK_RETURN = 0x0D;
+        private readonly TextBatchEditForm _form;
+
+        public CtrlEnterFilter(TextBatchEditForm form) { _form = form; }
+
+        public bool PreFilterMessage(ref Message m)
+        {
+            if (m.Msg != WM_KEYDOWN || (int)m.WParam != VK_RETURN) { return false; }
+            if ((Control.ModifierKeys & Keys.Control) == 0) { return false; }
+            // 仅在本窗为活动窗、且焦点确实在编辑控件上时拦截
+            if (Form.ActiveForm != _form) { return false; }
+            var ec = _form._grid?.EditingControl;
+            if (ec == null || !ec.IsHandleCreated || ec.Handle != m.HWnd) { return false; }
+            return _form.TryInsertLineBreakAtEditing(); // true=吞掉该按键，DataGridView 收不到
+        }
     }
 
     private void BuildGrid()
@@ -119,11 +166,11 @@ public class TextBatchEditForm : Form
         _grid.Columns[ColType].ReadOnly = true;
         _grid.Columns[ColType].SortMode = DataGridViewColumnSortMode.NotSortable;
 
-        _grid.Columns.Add(new DataGridViewCheckBoxColumn { Name = "multilang", HeaderText = "多语言", Width = 60 });
-        _grid.Columns[ColMultilang].SortMode = DataGridViewColumnSortMode.NotSortable;
-
-        _grid.Columns.Add(new DataGridViewCheckBoxColumn { Name = "noAutoTrans", HeaderText = "不自动翻译", Width = 84 });
-        _grid.Columns[ColNoAutoTrans].SortMode = DataGridViewColumnSortMode.NotSortable;
+        // —— 原值侧（只读，默认随“显示原值”整体隐藏）——
+        _grid.Columns.Add(new DataGridViewCheckBoxColumn { Name = "orig_multilang", HeaderText = "原多语言", Width = 70, ReadOnly = true, Visible = false });
+        _grid.Columns[ColOrigMultilang].SortMode = DataGridViewColumnSortMode.NotSortable;
+        _grid.Columns.Add(new DataGridViewCheckBoxColumn { Name = "orig_noAutoTrans", HeaderText = "原不自动翻译", Width = 92, ReadOnly = true, Visible = false });
+        _grid.Columns[ColOrigNoAuto].SortMode = DataGridViewColumnSortMode.NotSortable;
 
         var dnSource = LangHelper.DisplayName(_sourceLang);
 
@@ -148,6 +195,12 @@ public class TextBatchEditForm : Form
             _grid.Columns[idx].DefaultCellStyle.BackColor = System.Drawing.Color.FromArgb(245, 245, 245);
             _origLangCol[lang] = idx;
         }
+
+        // —— 新值侧复选框（可编辑），位于原值列右边、新值文本列左边 ——
+        _grid.Columns.Add(new DataGridViewCheckBoxColumn { Name = "multilang", HeaderText = "多语言", Width = 60 });
+        _grid.Columns[ColMultilang].SortMode = DataGridViewColumnSortMode.NotSortable;
+        _grid.Columns.Add(new DataGridViewCheckBoxColumn { Name = "noAutoTrans", HeaderText = "不自动翻译", Width = 84 });
+        _grid.Columns[ColNoAutoTrans].SortMode = DataGridViewColumnSortMode.NotSortable;
 
         // —— 新值列（可编辑）——
         _grid.Columns.Add("new_text", "源语言（" + dnSource + "）");
@@ -272,9 +325,9 @@ public class TextBatchEditForm : Form
                 "【列说明】\n" +
                 "  • 多语言：勾选=多语言文本（各语言新值列可编辑）；不勾选=单语言/语言无关串（仅源语言内容可编辑）。\n" +
                 "  • 不自动翻译：对应文本对象属性 “Do not translate automatically”，与是否多语言相互独立。\n" +
-                "  • 每组都有一个“文本列”和各“语言列”：原值侧为“原文本（中文）/原中文/原英文…”，新值侧为“源语言（中文）/中文/英文…”。\n" +
+                "  • 列顺序：#｜类型｜原多语言｜原不自动翻译｜原文本/原中文/原英文…｜多语言｜不自动翻译｜源语言文本/中文/英文…。\n" +
                 "  • 文本列与源语言列（中文）是同一份内容、始终同步：改任一格另一格跟随；单语言文本的值就写在这对列上。\n" +
-                "  • 原值列只读，用顶部“显示原值”展开/隐藏，便于逐列对照。\n\n" +
+                "  • 带“原”前缀的列是打开窗口时的原值（含原多语言/原不自动翻译两个只读复选框），整体只读，用顶部“显示原值”展开/隐藏。\n\n" +
                 "【写回规则】\n" +
                 "  • 只写发生改动的对象，未改的对象不写、不产生撤销点。\n" +
                 "  • 应用：有未保存修改时才可点，写回后保留窗口继续编辑；无修改时按钮置灰。\n" +
@@ -296,6 +349,8 @@ public class TextBatchEditForm : Form
 
     private void SetOrigColumnsVisible(bool visible)
     {
+        _grid.Columns[ColOrigMultilang].Visible = visible;
+        _grid.Columns[ColOrigNoAuto].Visible = visible;
         _grid.Columns[_origTextCol].Visible = visible;
         foreach (var idx in _origLangCol.Values) { _grid.Columns[idx].Visible = visible; }
         if (visible) { AutoFitColumns(); }
@@ -447,6 +502,10 @@ public class TextBatchEditForm : Form
                 var row = _grid.Rows[rowIdx];
                 row.Cells[ColIndex].Value = (i + 1).ToString();
                 row.Cells[ColType].Value = typeName;
+                // 原值侧复选框：打开窗口时的状态（只读，仅对照）
+                row.Cells[ColOrigMultilang].Value = isTranslated;
+                row.Cells[ColOrigNoAuto].Value = noAutoTrans;
+                // 新值侧复选框：初始同原值，可编辑
                 row.Cells[ColMultilang].Value = isTranslated;
                 row.Cells[ColNoAutoTrans].Value = noAutoTrans;
 
