@@ -18,8 +18,9 @@ public class TextBatchEditForm : Form
     private readonly Dictionary<ISOCode.Language, int> _langCol = new();
 
     private DataGridView _grid = null!;
+    private Button _okBtn = null!;
+    private Button _cancelBtn = null!;
     private Button _applyBtn = null!;
-    private Button _closeBtn = null!;
 
     private const int ColIndex = 0;
     private const int ColType = 1;
@@ -44,6 +45,7 @@ public class TextBatchEditForm : Form
         MinimumSize = new Size(560, 360);
 
         BuildGrid();
+        BuildTabs();
         BuildBottomBar();
         LoadRows();
     }
@@ -143,8 +145,46 @@ public class TextBatchEditForm : Form
             AddInLogger.Warn("网格 DataError: ctx=" + e.Context + " " + (e.Exception?.Message ?? ""));
             e.ThrowException = false;
         };
+        // grid 由 BuildTabs 挂入"编辑"标签页
+    }
 
-        Controls.Add(_grid);
+    private void BuildTabs()
+    {
+        var tabs = new TabControl { Dock = DockStyle.Fill };
+
+        // 标签页 1：编辑（表格）
+        var tabEdit = new TabPage("编辑");
+        _grid.Dock = DockStyle.Fill;
+        tabEdit.Controls.Add(_grid);
+
+        // 标签页 2：说明
+        var tabHelp = new TabPage("说明");
+        var help = new Label
+        {
+            Dock = DockStyle.Fill,
+            TextAlign = ContentAlignment.TopLeft,
+            Padding = new Padding(12),
+            Font = new Font(SystemFonts.MessageBoxFont.FontFamily, 9.5f),
+            Text =
+                "【列说明】\n" +
+                "  • 多语言：勾选=多语言文本（右侧各语言列可编辑）；不勾选=语言无关串（仅最左“源语言”列可编辑）。\n" +
+                "  • 不自动翻译：对应文本对象属性 “Do not translate automatically”，与是否多语言相互独立。\n" +
+                "  • 源语言列：项目输入文本时的默认语言；它与语言区中同源语言列双向同步。\n" +
+                "  • 其余语言列：按项目“翻译语言”设置动态生成，顺序固定。\n\n" +
+                "【编辑操作】\n" +
+                "  • 支持框选多格后 Ctrl+C / Ctrl+X / Ctrl+V 块复制粘贴：Tab 分列、换行分行，可与 Excel 互贴。\n" +
+                "  • Delete 清除选中格内容；右键菜单提供复制/剪切/粘贴/清除。\n\n" +
+                "【底部按钮】\n" +
+                "  • 确定：写回修改并关闭窗口。\n" +
+                "  • 取消：不做任何修改并关闭窗口。\n" +
+                "  • 应用：写回修改但不关闭窗口，可继续编辑。\n\n" +
+                "写回整批纳入一个撤销点，可在 EPLAN 中 Ctrl+Z 撤销。",
+        };
+        tabHelp.Controls.Add(help);
+
+        tabs.TabPages.Add(tabEdit);
+        tabs.TabPages.Add(tabHelp);
+        Controls.Add(tabs);
     }
 
     /// <summary>未翻译：仅镜像列可编辑，项目语言区只读；已翻译：全部语言列可编辑。</summary>
@@ -183,35 +223,43 @@ public class TextBatchEditForm : Form
 
     private void BuildBottomBar()
     {
-        var panel = new BufferedPanel { Dock = DockStyle.Bottom, Height = 86 };
+        var panel = new BufferedPanel { Dock = DockStyle.Bottom, Height = 46 };
 
-        var tip = new Label
+        // 表格：左列弹性占满（留空），右列 AutoSize 容纳按钮组 → 按钮整体右对齐，贴合 EPLAN 风格
+        var layout = new TableLayoutPanel { Dock = DockStyle.Fill, RowCount = 1, ColumnCount = 2 };
+        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100f));
+        layout.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        var rowStyle = new RowStyle(SizeType.Absolute, 46);
+        layout.RowStyles.Add(rowStyle);
+
+        // 左→右：确定 / 取消 / 应用
+        var btnPanel = new FlowLayoutPanel
         {
-            Text = "勾选\"多语言\"=多语言文本（各语言列可编辑），不勾选=语言无关串（仅左侧源语言列可编辑）。\n"
-                 + "\"不自动翻译\"对应文本属性 Do not translate automatically，与是否多语言相互独立。支持框选 Ctrl+C/X/V 块粘贴（Tab 分列、换行分行，可与 Excel 互贴），Delete 清除。",
-            Dock = DockStyle.Top,
-            Height = 40,
-            TextAlign = ContentAlignment.MiddleLeft,
-            Padding = new Padding(10, 2, 10, 0),
+            AutoSize = true,
+            AutoSizeMode = AutoSizeMode.GrowAndShrink,
+            FlowDirection = FlowDirection.LeftToRight,
+            WrapContents = false,
+            Anchor = AnchorStyles.Right,
+            Margin = new Padding(0),
         };
 
-        var btnPanel = new FlowLayoutPanel { Dock = DockStyle.Bottom, Height = 40, FlowDirection = FlowDirection.RightToLeft };
+        _okBtn = new Button { Text = "确定", Width = 90, Height = 30, Margin = new Padding(0, 6, 8, 0) };
+        _okBtn.Click += (_, _) => { if (ApplyChanges(quietSuccess: true)) { Close(); } };
 
-        _closeBtn = new Button { Text = "关闭", Width = 90, Height = 28, Margin = new Padding(6, 6, 10, 6) };
-        _closeBtn.Click += (_, _) => Close();
+        _cancelBtn = new Button { Text = "取消", Width = 90, Height = 30, Margin = new Padding(0, 6, 8, 0) };
+        _cancelBtn.Click += (_, _) => Close();
 
-        _applyBtn = new Button { Text = "写回 EPLAN", Width = 120, Height = 28, Margin = new Padding(6) };
-        _applyBtn.Click += (_, _) => ApplyChanges();
+        _applyBtn = new Button { Text = "应用", Width = 90, Height = 30, Margin = new Padding(0, 6, 12, 0) };
+        _applyBtn.Click += (_, _) => ApplyChanges(quietSuccess: true);
 
-        btnPanel.Controls.Add(_closeBtn);
+        btnPanel.Controls.Add(_okBtn);
+        btnPanel.Controls.Add(_cancelBtn);
         btnPanel.Controls.Add(_applyBtn);
 
-        panel.Controls.Add(tip);
-        panel.Controls.Add(btnPanel);
+        layout.Controls.Add(new Panel(), 0, 0); // 左列占位
+        layout.Controls.Add(btnPanel, 1, 0);
+        panel.Controls.Add(layout);
         Controls.Add(panel);
-
-        // 底栏双缓冲再保险：列宽变化后强制底栏重绘
-        _grid.ColumnWidthChanged += (_, _) => panel.Invalidate(true);
     }
 
     private void LoadRows()
@@ -420,7 +468,8 @@ public class TextBatchEditForm : Form
         return _grid[minCol, minRow];
     }
 
-    private void ApplyChanges()
+    /// <returns>true=写回成功且回读一致（可关窗）；false=异常或存在回读不一致（应保留窗口）。</returns>
+    private bool ApplyChanges(bool quietSuccess = false)
     {
         AddInLogger.Info("ApplyChanges: begin, rows=" + _grid.Rows.Count);
         var unknown = ISOCode.Language.L___;
@@ -542,17 +591,19 @@ public class TextBatchEditForm : Form
             AddInLogger.Info("ApplyChanges: 完成 对象数=" + changedObjects
                 + (mismatchRows.Count > 0 ? " 回读不一致行=[" + string.Join(",", mismatchRows) + "]" : " 回读校验全部一致"));
 
-            var msg = "已写回 " + changedObjects + " 个文本对象。\n可在 EPLAN 中用 Ctrl+Z 撤销本批修改。";
+            var msg = "已写回 " + changedObjects + " 个文本对象。可在 EPLAN 中用 Ctrl+Z 撤销本批修改。";
             if (mismatchRows.Count > 0)
             {
                 msg = "写回 " + changedObjects + " 个对象，但回读校验发现 " + mismatchRows.Count
                     + " 行与期望不一致（行 " + string.Join(",", mismatchRows.Take(20)) + "）。\n请查看日志，勿假设已全部生效。";
                 MessageBox.Show(msg, "批量修改选中文本", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return false;
             }
-            else
+            if (!quietSuccess)
             {
                 MessageBox.Show(msg, "批量修改选中文本", MessageBoxButtons.OK, MessageBoxIcon.Information);
             }
+            return true;
         }
         catch (Exception ex)
         {
@@ -560,6 +611,7 @@ public class TextBatchEditForm : Form
             try { txn?.Abort(); } catch (Exception abortEx) { AddInLogger.Error("事务 Abort 失败", abortEx); }
             MessageBox.Show("写回失败：" + ex.Message, "批量修改选中文本",
                 MessageBoxButtons.OK, MessageBoxIcon.Error);
+            return false;
         }
         finally
         {
