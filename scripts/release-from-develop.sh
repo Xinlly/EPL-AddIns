@@ -108,14 +108,11 @@ if [[ "$DRY_RUN" -eq 0 ]]; then
   informational_version="$(json_field "$BUILD_VERSION_REL" informationalVersion)"
   build_part="$(json_field "$BUILD_VERSION_REL" buildPart)"
   revision_part="$(json_field "$BUILD_VERSION_REL" revisionPart)"
-  generated_at="$(json_field "$BUILD_VERSION_REL" generatedAt)"
-  develop_commit="$(git rev-parse HEAD)"
 else
   assembly_version="1.0.2609.13202"
   file_version="$assembly_version"
   informational_version="${TAG_PREFIX}${assembly_version}"
   build_part="2609"; revision_part="13202"
-  generated_at="DRY-RUN"; develop_commit="DRY-RUN"
 fi
 
 tag="${TAG_PREFIX}${assembly_version}"
@@ -186,10 +183,7 @@ fi
 echo "==> Creating release commit and tag"
 run git add "$RELEASE_PROPS_REL"
 run git commit -m "chore(release): 固化版本 $tag"
-run git tag -a "$tag" -m "TextBatchEdit $tag
-
-Source develop commit: $develop_commit
-Dynamic build record generated at: $generated_at"
+run git tag -a "$tag" -m "文本批量编辑（TextBatchEdit）：在图形编辑器中选中文本，批量编辑各语言文本与翻译标志，支持原值对照、Excel 式复制粘贴、排序与整批一次撤销。"
 
 if [[ "$NO_PUSH" -eq 0 ]]; then
   echo "==> Pushing main and tag"
