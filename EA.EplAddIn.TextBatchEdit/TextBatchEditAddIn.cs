@@ -11,7 +11,7 @@ namespace EA.EplAddIn.TextBatchEdit;
 
 public class TextBatchEditAddIn : IEplAddIn
 {
-    private const string CtxMenuText = "批量编辑文本";
+    private const string CtxMenuText = "文本批量编辑";
     private const int WhCallWndProc = 4;          // 消息送达窗口过程"之前"回调（必须早于 BCG 的 OnInitMenuPopup）
     private const int WmInitMenu = 0x0116;        // 菜单激活（更早），wParam=HMENU
     private const int WmInitMenuPopup = 0x0117;   // 弹出菜单显示前，wParam=HMENU

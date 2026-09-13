@@ -46,4 +46,27 @@ internal static class LangHelper
         var n = lang.ToString();
         return n.StartsWith("L_", StringComparison.Ordinal) ? n.Substring(2) : n;
     }
+
+    /// <summary>列标题用中文语言名（如 zh_CN→中文、en_US→英文）；未知语言回退为短码。</summary>
+    public static string DisplayName(ISOCode.Language lang)
+    {
+        switch (Code(lang))
+        {
+            case "zh_CN": return "中文";
+            case "zh_TW": return "繁体中文";
+            case "en_US": return "英文";
+            case "ja_JP": return "日文";
+            case "ko_KR": return "韩文";
+            case "de_DE": return "德文";
+            case "fr_FR": return "法文";
+            case "es_ES": return "西班牙文";
+            case "ru_RU": return "俄文";
+            case "pt_BR": return "葡萄牙文（巴西）";
+            case "it_IT": return "意大利文";
+            case "nl_NL": return "荷兰文";
+            case "pl_PL": return "波兰文";
+            case "cs_CZ": return "捷克文";
+            default: return Code(lang);
+        }
+    }
 }
