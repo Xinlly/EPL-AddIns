@@ -1,3 +1,4 @@
+using Eplan.EplApi.Base;
 using System;
 using System.IO;
 using System.Text;
@@ -6,7 +7,10 @@ namespace EA.EplAddIn.TextBatchEdit;
 
 /// <summary>
 /// 轻量文件日志：DEBUG / INFO / WARN / ERROR 四级，按天一个文件。
-/// 默认目录：DLL 所在目录下 logs\；不可写时降级 %TEMP%\EA.EplAddIn.TextBatchEdit\logs。
+/// 目录优先级：
+/// 1) 脚本主数据目录下的 .log：$(MD_SCRIPTS)\.log（与 EPL-Scripts 日志位置约定一致，便于统一查看）
+/// 2) DLL 所在目录下 logs\
+/// 3) %TEMP%\EA.EplAddIn.TextBatchEdit\logs
 /// </summary>
 public static class AddInLogger
 {
@@ -24,24 +28,41 @@ public static class AddInLogger
 
     private static string ResolveLogDirectory()
     {
-        string preferred;
+        // 1) $(MD_SCRIPTS)\.log —— 脚本主数据目录（用户在此放置 .log 目录/junction）
         try
         {
-            preferred = Path.Combine(
+            var mdScripts = PathMap.SubstitutePath("$(MD_SCRIPTS)");
+            if (!string.IsNullOrEmpty(mdScripts))
+            {
+                var preferred = Path.Combine(mdScripts, ".log");
+                if (TryWritable(preferred)) { return preferred; }
+            }
+        }
+        catch { /* PathMap 早期可能不可用，走回退 */ }
+
+        // 2) DLL 所在目录 logs\
+        try
+        {
+            var dllDir = Path.Combine(
                 Path.GetDirectoryName(typeof(AddInLogger).Assembly.Location) ?? AppDomain.CurrentDomain.BaseDirectory,
                 "logs");
-            Directory.CreateDirectory(preferred);
-            var probe = Path.Combine(preferred, ".write-probe");
-            File.WriteAllText(probe, "");
-            File.Delete(probe);
-            return preferred;
+            if (TryWritable(dllDir)) { return dllDir; }
         }
-        catch
-        {
-            var fallback = Path.Combine(Path.GetTempPath(), "EA.EplAddIn.TextBatchEdit", "logs");
-            Directory.CreateDirectory(fallback);
-            return fallback;
-        }
+        catch { /* 走回退 */ }
+
+        // 3) 临时目录
+        var fallback = Path.Combine(Path.GetTempPath(), "EA.EplAddIn.TextBatchEdit", "logs");
+        Directory.CreateDirectory(fallback);
+        return fallback;
+    }
+
+    private static bool TryWritable(string dir)
+    {
+        Directory.CreateDirectory(dir);
+        var probe = Path.Combine(dir, ".write-probe");
+        File.WriteAllText(probe, "");
+        File.Delete(probe);
+        return true;
     }
 
     private static void Write(string level, string message, Exception? ex)
