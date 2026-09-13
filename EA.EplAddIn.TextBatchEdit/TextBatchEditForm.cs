@@ -23,6 +23,14 @@ public class TextBatchEditForm : Form
     private readonly Dictionary<ISOCode.Language, int> _newLangCol = new();  // 中文/英文…
     // 每行“已保存”基线，用于脏检查
     private readonly List<RowState> _baseline = new();
+    // 开窗时的初始值，用于标识“已保存但相对原值有改动”的单元格
+    private readonly List<RowState> _initial = new();
+
+    // 单元格状态配色
+    private static readonly System.Drawing.Color ReadOnlyGray = System.Drawing.Color.FromArgb(225, 225, 225);  // 只读原值（加深）
+    private static readonly System.Drawing.Color DirtyYellow = System.Drawing.Color.FromArgb(255, 242, 204);   // 已改未保存
+    private static readonly System.Drawing.Color SavedGreen = System.Drawing.Color.FromArgb(221, 244, 223);     // 已改已保存
+    private static readonly System.Drawing.Color OrigChangedBlue = System.Drawing.Color.FromArgb(213, 232, 246);// 原值：对应新值已保存改动
 
     private DataGridView _grid = null!;
     private CheckBox _showOrigChk = null!;
@@ -30,6 +38,12 @@ public class TextBatchEditForm : Form
     private Button _cancelBtn = null!;
     private Button _applyBtn = null!;
     private CtrlEnterFilter? _keyFilter;
+
+    // 任意单元格下边缘拖拽行高的状态
+    private int _dragRow = -1;
+    private int _dragStartY;
+    private int _dragStartHeight;
+    private const int ResizeEdge = 5; // 距单元格下边缘多少像素视为拖行高热区
 
     private const int ColIndex = 0;
     private const int ColType = 1;
@@ -180,7 +194,6 @@ public class TextBatchEditForm : Form
         _grid.Columns[_origTextCol].ReadOnly = true;
         _grid.Columns[_origTextCol].Visible = false; // 默认隐藏，与其余原值列一致，由“显示原值”统一展开
         _grid.Columns[_origTextCol].SortMode = DataGridViewColumnSortMode.NotSortable;
-        _grid.Columns[_origTextCol].DefaultCellStyle.BackColor = System.Drawing.Color.FromArgb(245, 245, 245);
 
         for (var i = 0; i < _projectLangs.Count; i++)
         {
@@ -192,7 +205,6 @@ public class TextBatchEditForm : Form
             _grid.Columns[idx].ReadOnly = true;
             _grid.Columns[idx].Visible = false; // 默认隐藏，由“显示原值”统一展开
             _grid.Columns[idx].SortMode = DataGridViewColumnSortMode.NotSortable;
-            _grid.Columns[idx].DefaultCellStyle.BackColor = System.Drawing.Color.FromArgb(245, 245, 245);
             _origLangCol[lang] = idx;
         }
 
@@ -260,12 +272,19 @@ public class TextBatchEditForm : Form
         menu.Items.Add("剪切(&X)", null, (_, _) => CutSelection());
         menu.Items.Add("粘贴(&V)", null, (_, _) => PasteClipboard());
         menu.Items.Add("清除内容(&D)", null, (_, _) => ClearSelection());
+        menu.Items.Add("换行(&L)", null, (_, _) => InsertLineBreakIntoCurrent()); // 快捷键不可用时的兜底入口
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("调整列宽(&A)", null, (_, _) => AutoFitColumns());
         _grid.ContextMenuStrip = menu;
 
         _grid.KeyDown += GridOnKeyDown;
         _grid.CellMouseClick += GridOnCellMouseClick;
+        _grid.CellFormatting += GridOnCellFormatting; // 统一单元格状态着色
+        // 任意单元格下边缘拖拽调行高
+        _grid.MouseDown += GridOnMouseDownForRowResize;
+        _grid.MouseMove += GridOnMouseMoveForRowResize;
+        _grid.MouseUp += GridOnMouseUpForRowResize;
+        _grid.MouseLeave += (_, _) => { if (_dragRow < 0) { _grid.Cursor = Cursors.Default; } };
         // 正在编辑最后一格（焦点未离开、CellValueChanged 未触发）时，一旦有输入即乐观点亮应用；
         // 是否真有改动仍以保存前 EndEdit 后的精确脏检查为准，避免要点两次。
         _grid.EditingControlShowing += (_, e) =>
@@ -336,9 +355,15 @@ public class TextBatchEditForm : Form
                 "  • 每次“应用/确定”若确有改动，整批合并为一个撤销点，可在 EPLAN 中 Ctrl+Z 一次撤销。\n\n" +
                 "【编辑操作】\n" +
                 "  • 单元格内按 Ctrl+Enter 插入换行标记 ¶（写回时替换为真正换行，与 EPLAN 原生表编辑一致）；普通 Enter 提交当前格。\n" +
+                "  • 快捷键不可用时，右键菜单选“换行”也可在当前格插入 ¶。\n" +
                 "  • 表格内换行一律显示为 ¶（单行显示）；超长未换行文本会在单元格内截断，鼠标悬停可看全文，或拉宽列/双击编辑查看。\n" +
-                "  • 可拖动行首分隔线手动调整行高、拖动列分隔线调整列宽；右键“调整列宽”可按内容自适应。\n" +
-                "  • 框选多格后 Ctrl+C / Ctrl+X / Ctrl+V 复制粘贴，遵循 Excel 规则（Tab 分列、行换行分行、双引号内的换行属于同一单元格，可与 Excel 互贴），Delete 清除。",
+                "  • 鼠标移到任意单元格下边缘（出现上下箭头）可拖动调整行高；拖列分隔线调整列宽，右键“调整列宽”可按内容自适应。\n" +
+                "  • 框选多格后 Ctrl+C / Ctrl+X / Ctrl+V 复制粘贴，遵循 Excel 规则（Tab 分列、行换行分行、双引号内的换行属于同一单元格，可与 Excel 互贴），Delete 清除。\n\n" +
+                "【颜色含义】\n" +
+                "  • 深灰：只读的原值列/不可写单元格。\n" +
+                "  • 浅黄：已修改但尚未保存（应用/确定后消失）。\n" +
+                "  • 浅绿：已修改且已保存（相对开窗原值）。\n" +
+                "  • 浅蓝：原值侧单元格，其对应的新值已保存改动；未保存阶段原值不变色。",
         };
         tabHelp.Controls.Add(help);
 
@@ -385,13 +410,145 @@ public class TextBatchEditForm : Form
             var c = _newLangCol[lang];
             var editable = translated || lang == _sourceLang;
             _grid[c, row].ReadOnly = !editable;
-            _grid[c, row].Style.BackColor = editable
-                ? System.Drawing.Color.White
-                : System.Drawing.Color.FromArgb(245, 245, 245);
         }
         // 文本列（单语言内容）始终可编辑
         _grid[_newTextCol, row].ReadOnly = false;
-        _grid[_newTextCol, row].Style.BackColor = System.Drawing.Color.White;
+    }
+
+    // —— 右键菜单“换行”：快捷键不可用时的兜底入口 ——
+    private void InsertLineBreakIntoCurrent()
+    {
+        var cell = _grid.CurrentCell;
+        if (cell == null || cell.RowIndex < 0 || !IsNewValueCol(cell.ColumnIndex) || cell.ReadOnly)
+        {
+            MessageBox.Show("请先选中一个可编辑的文本单元格（新值侧）。", "换行",
+                MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+        if (!_grid.IsCurrentCellInEditMode)
+        {
+            _grid.BeginEdit(false);
+            if (_grid.EditingControl is TextBox tb0) { tb0.SelectionStart = tb0.TextLength; tb0.SelectionLength = 0; }
+        }
+        TryInsertLineBreakAtEditing();
+    }
+
+    private bool IsEditableStateCol(int col) =>
+        col == ColMultilang || col == ColNoAutoTrans || IsNewValueCol(col);
+
+    // —— 单元格状态着色（只读灰 / 已改未保存黄 / 已改已保存绿 / 原值随已保存改动变蓝）——
+    private void GridOnCellFormatting(object? sender, DataGridViewCellFormattingEventArgs e)
+    {
+        var row = e.RowIndex;
+        var col = e.ColumnIndex;
+        if (row < 0 || row >= _baseline.Count) { return; }
+
+        // 原值侧
+        if (IsOrigCol(col))
+        {
+            var newCol = CorrespondingNewCol(col);
+            e.CellStyle!.BackColor =
+                (!CellIsDirty(row, newCol) && CellSavedChanged(row, newCol)) ? OrigChangedBlue : ReadOnlyGray;
+            return;
+        }
+
+        // 新值侧复选框 / 文本
+        if (IsEditableStateCol(col))
+        {
+            if (CellIsDirty(row, col)) { e.CellStyle!.BackColor = DirtyYellow; }
+            else if (CellSavedChanged(row, col)) { e.CellStyle!.BackColor = SavedGreen; }
+            else if (_grid[col, row].ReadOnly) { e.CellStyle!.BackColor = ReadOnlyGray; }
+            // else 保持默认白底
+        }
+    }
+
+    private bool IsOrigCol(int col) =>
+        col == ColOrigMultilang || col == ColOrigNoAuto ||
+        col == _origTextCol || _origLangCol.ContainsValue(col);
+
+    private int CorrespondingNewCol(int origCol)
+    {
+        if (origCol == ColOrigMultilang) { return ColMultilang; }
+        if (origCol == ColOrigNoAuto) { return ColNoAutoTrans; }
+        if (origCol == _origTextCol) { return _newTextCol; }
+        foreach (var kv in _origLangCol)
+        {
+            if (kv.Value == origCol) { return _newLangCol[kv.Key]; }
+        }
+        return -1;
+    }
+
+    /// <summary>把某一“新值状态列”归约为可比较的字符串（标志位或某语言文本）。</summary>
+    private string StateValue(RowState s, int col)
+    {
+        if (col == ColMultilang) { return s.Multilang ? "1" : "0"; }
+        if (col == ColNoAutoTrans) { return s.NoAuto ? "1" : "0"; }
+        var lang = col == _newTextCol ? _sourceLang : _newLangCol.First(kv => kv.Value == col).Key;
+        return s.V.TryGetValue(lang, out var v) ? v : string.Empty;
+    }
+
+    private string CurrentCellValue(int row, int col)
+    {
+        if (col == ColMultilang || col == ColNoAutoTrans)
+        {
+            return Convert.ToBoolean(_grid[col, row].Value ?? false) ? "1" : "0";
+        }
+        return _grid[col, row].Value as string ?? string.Empty;
+    }
+
+    private bool CellIsDirty(int row, int col) =>
+        CurrentCellValue(row, col) != StateValue(_baseline[row], col);
+
+    private bool CellSavedChanged(int row, int col) =>
+        CurrentCellValue(row, col) != StateValue(_initial[row], col);
+
+    private static RowState CloneRow(RowState s) => new()
+    {
+        Multilang = s.Multilang,
+        NoAuto = s.NoAuto,
+        V = new Dictionary<ISOCode.Language, string>(s.V),
+    };
+
+    // —— 任意列下边缘拖拽调整行高 ——
+    private void GridOnMouseDownForRowResize(object? sender, MouseEventArgs e)
+    {
+        if (e.Button != MouseButtons.Left || _grid.IsCurrentCellInEditMode) { return; }
+        var hit = _grid.HitTest(e.X, e.Y);
+        if (hit.Type != DataGridViewHitTestType.Cell || hit.RowIndex < 0) { return; }
+        var rect = _grid.GetCellDisplayRectangle(hit.ColumnIndex, hit.RowIndex, false);
+        if (Math.Abs(e.Y - rect.Bottom) <= ResizeEdge)
+        {
+            _dragRow = hit.RowIndex;
+            _dragStartY = e.Y;
+            _dragStartHeight = _grid.Rows[hit.RowIndex].Height;
+            _grid.Cursor = Cursors.SizeNS;
+        }
+    }
+
+    private void GridOnMouseMoveForRowResize(object? sender, MouseEventArgs e)
+    {
+        if (_dragRow >= 0)
+        {
+            var h = Math.Max(18, _dragStartHeight + (e.Y - _dragStartY));
+            _grid.Rows[_dragRow].Height = h;
+            return;
+        }
+        if (_grid.IsCurrentCellInEditMode) { return; }
+        var hit = _grid.HitTest(e.X, e.Y);
+        if (hit.Type == DataGridViewHitTestType.Cell && hit.RowIndex >= 0)
+        {
+            var rect = _grid.GetCellDisplayRectangle(hit.ColumnIndex, hit.RowIndex, false);
+            _grid.Cursor = Math.Abs(e.Y - rect.Bottom) <= ResizeEdge ? Cursors.SizeNS : Cursors.Default;
+        }
+        else if (hit.Type != DataGridViewHitTestType.ColumnHeader)
+        {
+            _grid.Cursor = Cursors.Default; // 列标题边缘交给 DataGridView 自己的列宽光标
+        }
+    }
+
+    private void GridOnMouseUpForRowResize(object? sender, MouseEventArgs e)
+    {
+        if (_dragRow >= 0) { _dragRow = -1; _grid.Cursor = Cursors.Default; }
     }
 
     private void BuildBottomBar()
@@ -531,7 +688,9 @@ public class TextBatchEditForm : Form
                 }
 
                 SetRowEditable(rowIdx, isTranslated);
-                _baseline.Add(SnapshotRow(rowIdx));
+                var snap = SnapshotRow(rowIdx);
+                _baseline.Add(snap);
+                _initial.Add(CloneRow(snap));
             }
         }
         finally
@@ -582,6 +741,7 @@ public class TextBatchEditForm : Form
     private void UpdateApplyEnabled()
     {
         if (_applyBtn != null) { _applyBtn.Enabled = DirtyRows().Count > 0; }
+        if (_grid != null) { _grid.Invalidate(); } // 触发 CellFormatting 重算脏/已保存底色
     }
 
     private void EditingTextChanged(object? sender, EventArgs e)
