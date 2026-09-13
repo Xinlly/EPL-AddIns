@@ -34,6 +34,7 @@ public class TextBatchEditForm : Form
 
     private DataGridView _grid = null!;
     private CheckBox _showOrigChk = null!;
+    private CheckBox _showSrcChk = null!;
     private Button _okBtn = null!;
     private Button _cancelBtn = null!;
     private Button _applyBtn = null!;
@@ -102,12 +103,8 @@ public class TextBatchEditForm : Form
         // 应用层消息过滤器：在消息派发前吞掉编辑态的 Ctrl+Enter，防止被 DataGridView 当成“结束编辑”
         _keyFilter = new CtrlEnterFilter(this);
         Application.AddMessageFilter(_keyFilter);
-        // 窗体真正显示（grid 句柄已建）后：按复选框同步原值列可见性，并自动调整一次列宽
-        Shown += (_, _) =>
-        {
-            SetOrigColumnsVisible(_showOrigChk.Checked);
-            AutoFitColumns();
-        };
+        // 窗体真正显示（grid 句柄已建）后：按两个开关初始化列可见性（内含一次自动列宽）
+        Shown += (_, _) => UpdateColumnVisibility();
     }
 
     protected override void OnFormClosed(FormClosedEventArgs e)
@@ -318,16 +315,36 @@ public class TextBatchEditForm : Form
         var tabEdit = new TabPage("编辑");
 
         var bar = new Panel { Dock = DockStyle.Top, Height = 30 };
+        var barFlow = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            FlowDirection = FlowDirection.LeftToRight,
+            WrapContents = false,
+            Padding = new Padding(8, 5, 0, 0),
+        };
+
         _showOrigChk = new CheckBox
         {
             Text = "显示原值",
-            Dock = DockStyle.Left,
-            Width = 120,
+            Width = 100,
             Checked = false,
             TextAlign = ContentAlignment.MiddleLeft,
         };
-        _showOrigChk.CheckedChanged += (_, _) => SetOrigColumnsVisible(_showOrigChk.Checked);
-        bar.Controls.Add(_showOrigChk);
+        _showOrigChk.CheckedChanged += (_, _) => UpdateColumnVisibility();
+
+        _showSrcChk = new CheckBox
+        {
+            Text = "显示源语言",
+            Width = 110,
+            Checked = true, // 默认显示源语言两列（含可编辑的新值源语言列）
+            TextAlign = ContentAlignment.MiddleLeft,
+            Margin = new Padding(12, 0, 0, 0),
+        };
+        _showSrcChk.CheckedChanged += (_, _) => UpdateColumnVisibility();
+
+        barFlow.Controls.Add(_showOrigChk);
+        barFlow.Controls.Add(_showSrcChk);
+        bar.Controls.Add(barFlow);
 
         tabEdit.Controls.Add(_grid); // 先加：Fill 占满
         tabEdit.Controls.Add(bar);   // 再加：Top 压在上方
@@ -341,29 +358,24 @@ public class TextBatchEditForm : Form
             Padding = new Padding(12),
             Font = new Font(SystemFonts.MessageBoxFont.FontFamily, 9.5f),
             Text =
-                "【列说明】\n" +
-                "  • 多语言：勾选=多语言文本（各语言新值列可编辑）；不勾选=单语言/语言无关串（仅源语言内容可编辑）。\n" +
-                "  • 不自动翻译：对应文本对象属性 “Do not translate automatically”，与是否多语言相互独立。\n" +
-                "  • 列顺序：#｜类型｜原多语言｜原不自动翻译｜原文本/原中文/原英文…｜多语言｜不自动翻译｜源语言文本/中文/英文…。\n" +
-                "  • 文本列与源语言列（中文）是同一份内容、始终同步：改任一格另一格跟随；单语言文本的值就写在这对列上。\n" +
-                "  • 带“原”前缀的列是打开窗口时的原值（含原多语言/原不自动翻译两个只读复选框），整体只读，用顶部“显示原值”展开/隐藏。\n\n" +
-                "【写回规则】\n" +
-                "  • 只写发生改动的对象，未改的对象不写、不产生撤销点。\n" +
-                "  • 应用：有未保存修改时才可点，写回后保留窗口继续编辑；无修改时按钮置灰。\n" +
-                "  • 确定：等同先应用一次，成功后关闭窗口；无修改则直接关闭。\n" +
-                "  • 取消：放弃未保存修改并关闭。\n" +
-                "  • 每次“应用/确定”若确有改动，整批合并为一个撤销点，可在 EPLAN 中 Ctrl+Z 一次撤销。\n\n" +
-                "【编辑操作】\n" +
-                "  • 单元格内按 Ctrl+Enter 插入换行标记 ¶（写回时替换为真正换行，与 EPLAN 原生表编辑一致）；普通 Enter 提交当前格。\n" +
-                "  • 快捷键不可用时，右键菜单选“换行”也可在当前格插入 ¶。\n" +
-                "  • 表格内换行一律显示为 ¶（单行显示）；超长未换行文本会在单元格内截断，鼠标悬停可看全文，或拉宽列/双击编辑查看。\n" +
-                "  • 鼠标移到任意单元格下边缘（出现上下箭头）可拖动调整行高；拖列分隔线调整列宽，右键“调整列宽”可按内容自适应。\n" +
-                "  • 框选多格后 Ctrl+C / Ctrl+X / Ctrl+V 复制粘贴，遵循 Excel 规则（Tab 分列、行换行分行、双引号内的换行属于同一单元格，可与 Excel 互贴），Delete 清除。\n\n" +
-                "【颜色含义】\n" +
-                "  • 深灰：只读的原值列/不可写单元格。\n" +
-                "  • 浅黄：已修改但尚未保存（应用/确定后消失）。\n" +
-                "  • 浅绿：已修改且已保存（相对开窗原值）。\n" +
-                "  • 浅蓝：原值侧单元格，其对应的新值已保存改动；未保存阶段原值不变色。",
+                "【怎么用】\n" +
+                "  • 直接双击格子修改文字；改完点“应用”保存，或点“确定”保存并关闭。\n" +
+                "  • 想放弃本次修改点“取消”；“应用”后窗口不关闭，可继续修改。\n\n" +
+                "【两个勾选框】\n" +
+                "  • 多语言：勾选后可填写中文、英文等各语言内容；不勾选则只填一份内容。\n" +
+                "  • 不自动翻译：勾选后该文本不参与自动翻译。\n\n" +
+                "【上方两个开关】\n" +
+                "  • 显示原值：在左侧展开灰色的“原…”列，方便对照修改前的内容。\n" +
+                "  • 显示源语言：显示/隐藏源语言那一列（原值侧与新值侧各一列）。\n\n" +
+                "【换行与排版】\n" +
+                "  • 单元格里按 Ctrl+Enter 换行（显示为 ¶，保存后即为真正换行）；也可右键选“换行”。\n" +
+                "  • 拖动格子下边缘可改该行高度，拖动表头分隔线可改列宽；右键“调整列宽”自动适配。\n" +
+                "  • 可像 Excel 一样框选后复制、粘贴、删除。\n\n" +
+                "【格子颜色】\n" +
+                "  • 灰色：只读，不能修改。\n" +
+                "  • 黄色：已修改、还没保存。\n" +
+                "  • 绿色：已修改并保存。\n" +
+                "  • 蓝色（原值列）：对应的新内容已保存且与原值不同。",
         };
         tabHelp.Controls.Add(help);
 
@@ -372,13 +384,33 @@ public class TextBatchEditForm : Form
         Controls.Add(tabs);
     }
 
-    private void SetOrigColumnsVisible(bool visible)
+    /// <summary>
+    /// 列可见性 = 两个开关的组合：
+    ///   原多语言/原不自动翻译/各原语言列(原中文/原英文…)：仅受“显示原值”控制；
+    ///   原文本（源语言文本列）：受两者共同控制 = 显示原值 AND 显示源语言；
+    ///   源语言（新值侧源语言文本列）：仅受“显示源语言”控制；
+    ///   其余新值列（多语言/不自动翻译/中文/英文…）：常显。
+    /// </summary>
+    private void UpdateColumnVisibility()
     {
-        _grid.Columns[ColOrigMultilang].Visible = visible;
-        _grid.Columns[ColOrigNoAuto].Visible = visible;
-        _grid.Columns[_origTextCol].Visible = visible;
-        foreach (var idx in _origLangCol.Values) { _grid.Columns[idx].Visible = visible; }
-        if (visible) { AutoFitColumns(); }
+        var showOrig = _showOrigChk.Checked;
+        var showSrc = _showSrcChk.Checked;
+
+        // 若正编辑的列即将被隐藏，先提交编辑，避免 DataGridView 因 CurrentCell 落到隐藏列报错
+        if (_grid.IsCurrentCellInEditMode) { _grid.EndEdit(); }
+
+        // 原值侧复选框、各原语言列：只看“显示原值”
+        _grid.Columns[ColOrigMultilang].Visible = showOrig;
+        _grid.Columns[ColOrigNoAuto].Visible = showOrig;
+        foreach (var idx in _origLangCol.Values) { _grid.Columns[idx].Visible = showOrig; }
+
+        // 原值·源语言文本列：两个开关同时为真才显示
+        _grid.Columns[_origTextCol].Visible = showOrig && showSrc;
+
+        // 新值·源语言文本列：只看“显示源语言”
+        _grid.Columns[_newTextCol].Visible = showSrc;
+
+        AutoFitColumns();
     }
 
     /// <summary>
