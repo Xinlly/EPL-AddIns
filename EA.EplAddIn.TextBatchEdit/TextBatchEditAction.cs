@@ -15,6 +15,20 @@ public class TextBatchEditAction : IEplAction
 {
     public const string ActionName = "TextBatchEditAction";
 
+    /// <summary>当前选择集中是否存在文本对象（TextBase）。供 Execute 与右键菜单钩子共用。</summary>
+    public static bool SelectionHasText()
+    {
+        try
+        {
+            var sel = new SelectionSet().Selection;
+            return sel != null && sel.Any(o => o is TextBase);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
     [DeclareAction(ActionName)]
     public bool Execute(ActionCallingContext oActionName)
     {
