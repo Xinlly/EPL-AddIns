@@ -68,7 +68,7 @@ dotnet build EPL-AddIns.slnx
 
 - **Git tag / AssemblyVersion / FileVersion / InformationalVersion 四者一致**：tag 带 `v`（`v1.0.2609.13202`），三个 .NET 字段用纯数字（`1.0.2609.13202`），InformationalVersion 带 `v`。
 - **develop 动态 / main 固化（可复现）**：
-  - develop（日常测试）：`./scripts/build.sh` 每次编译前由 `scripts/generate-dynamic-version.ps1` 按当前时间生成不入库的 `.temp/TextBatchEdit.DynamicVersion.props`（6 分钟粒度），版本随构建变，便于识别 ShadowCopy 旧 DLL。
+  - develop（日常测试）：`./scripts/build.sh` 用 bash `date` 按北京时间计算并写不入库的 `.temp/TextBatchEdit.DynamicVersion.props`（6 分钟粒度），版本随构建变，便于识别 ShadowCopy 旧 DLL。
   - main / tag（正式发布）：入库的 `EA.EplAddIn.TextBatchEdit/release-version.props` 提供固定 `VersionBuildPart`/`VersionRevisionPart`，checkout 同一 tag 重编版本号不变。
   - 直接用 `dotnet`/VS 编译且两种 props 都不存在时，csproj 兜底按小时粒度 `ddHH` 动态（mode=`dynamic-hour-fallback`），保证可编译。
   - 每次构建后写 `.temp/build-version.json`（含三字段版本、buildPart/revisionPart、mode、生成时间），`.temp/` 已 gitignore。
