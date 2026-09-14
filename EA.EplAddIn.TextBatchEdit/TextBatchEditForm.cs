@@ -51,12 +51,6 @@ public class TextBatchEditForm : Form
     private Timer? _autoSaveTimer;
     private bool _saving; // 抑制保存/刷新过程中自动保存的重入
 
-    // 复选框选中提示（独立 ToolTip，显示 3 秒自动消失）
-    private readonly ToolTip _checkHint = new() { InitialDelay = 0, ReshowDelay = 0, AutomaticDelay = 0, UseFading = true };
-    private readonly Timer _checkHintTimer = new() { Interval = 3000 };
-    private int _lastHintRow = -1;
-    private int _lastHintCol = -1;
-
 
     // 双击列标题三级排序：默认(结构→X↑→Y↓) → 升 → 降 → 默认
     private int _sortCol = -1;
@@ -366,8 +360,18 @@ public class TextBatchEditForm : Form
 
         _grid.KeyDown += GridOnKeyDown;
         _grid.ColumnHeaderMouseDoubleClick += GridOnHeaderDoubleClick; // 双击表头：顺序/倒序/默认
+        _grid.ColumnHeaderMouseClick += (_, e) =>
+        {
+            if (e.Button != MouseButtons.Left || _grid.IsCurrentCellInEditMode) { return; }
+            SelectColumn(e.ColumnIndex);
+        };
+        _grid.RowHeaderMouseClick += (_, e) =>
+        {
+            if (e.Button != MouseButtons.Left || _grid.IsCurrentCellInEditMode) { return; }
+            SelectRow(e.RowIndex);
+        };
         _grid.CellMouseDown += GridOnCellMouseDown;
-        // 复选框为只读防误触，内置 cell tooltip 在该宿主下不稳定；改为“选中该格时”由独立 ToolTip 提示 3 秒（见 ShowCheckBoxHint）。
+        // 复选框为只读防误触；操作提示放在底部状态栏（当前格为复选框列时显示“复选框双击修改”）。
         // 双击：可写复选框格翻转勾选（列恒 ReadOnly，单击/空格均不翻转）；文本格直接进入编辑
         _grid.CellDoubleClick += (_, e) =>
         {
@@ -394,12 +398,7 @@ public class TextBatchEditForm : Form
         _grid.CurrentCellChanged += (_, _) =>
         {
             if (_focusCellChk is { Checked: true }) { _grid.Invalidate(); }
-            ShowCheckBoxHint();
-        };
-        _checkHintTimer.Tick += (_, _) =>
-        {
-            _checkHintTimer.Stop();
-            _checkHint.Hide(_grid);
+            UpdateApplyEnabled(); // 刷新底部状态：当前格为复选框时在状态区提示“双击修改”
         };
         _grid.CellPainting += GridOnCellPainting;     // 自绘列头排序箭头
         // 行高拖拽交给 DataGridView 内置：分隔条只在行号（行首）列底边，数据列不响应
@@ -596,7 +595,8 @@ public class TextBatchEditForm : Form
                 "  • 可像 Excel 一样框选后复制、剪切、粘贴、删除（快捷键 Ctrl+C/X/V、Delete，或右键菜单）。\n" +
                 "  • 粘贴同 Excel：只选中一个格时，从该格起直接铺下整块内容；选中多格时在选区内按行列整除重复，\n" +
                 "    不能整除会提示不匹配。\n" +
-                "  • 复选框需双击才切换（单击只选中，选中时提示“双击修改”3 秒）；复制为 TRUE/FALSE，粘贴时 TRUE/1/是/√等识别为勾选。\n" +
+                "  • 复选框需双击才切换（单击只选中；选中后底部状态栏提示“复选框双击修改”）；复制为 TRUE/FALSE，粘贴时 TRUE/1/是/√等识别为勾选。\n" +
+                "  • 单击列头选中整列、单击行号选中整行、点左上角格选中全表；可在此基础上复制/清除。\n" +
                 "  • 关闭某行“多语言”时，非源语言译文会暂存并清空；重新开启时自动写回，避免切换丢值。\n" +
                 "  • 右键“还原选中的行/还原当前值”可恢复到打开窗口时的原值（即使已保存也可还原，再保存即写回）。\n\n" +
                 "【窗口用法】\n" +
@@ -693,14 +693,14 @@ public class TextBatchEditForm : Form
     }
 
     /// <summary>
-    /// 自动列宽：宽度取“数据内容”与“表头最长一行（多行标题按最长行算）”的较大者，
-    /// 再统一为排序箭头预留右侧空间；限制在 60~420px。
+    /// 自动列宽：宽度取“数据内容”与“表头最长一行（多行标题按最长行算）”的较大者，加紧凑内边距；
+    /// 仅当前排序列额外为自绘箭头预留右侧宽度（其余列不预留）；限制在 40~420px。
     /// </summary>
     private void AutoFitColumns()
     {
-        const int minW = 60, maxW = 420;
-        const int pad = 12;          // 文字左右内边距合计
-        const int arrowReserve = 20; // 给列标题排序箭头预留的右侧宽度
+        const int minW = 40, maxW = 420;
+        const int pad = 8;           // 文字左右内边距合计
+        const int arrowReserve = 18; // 仅当前排序列给排序箭头预留
         var flags = TextFormatFlags.SingleLine | TextFormatFlags.Left | TextFormatFlags.NoPadding;
 
         using var g = _grid.CreateGraphics();
@@ -720,7 +720,7 @@ public class TextBatchEditForm : Form
 
             if (col is DataGridViewCheckBoxColumn)
             {
-                best = Math.Max(best, 18); // 复选框本体占位
+                best = Math.Max(best, 16); // 复选框本体占位
             }
 
             // 数据单元格内容（¶ 单行显示，不换行）
@@ -734,7 +734,9 @@ public class TextBatchEditForm : Form
                 }
             }
 
-            var w = best + pad + arrowReserve;
+            // 只有正在显示排序箭头的那一列才预留箭头空间
+            var arrow = col.Index == _sortCol ? arrowReserve : 0;
+            var w = best + pad + arrow;
             col.Width = Math.Max(minW, Math.Min(maxW, w));
         }
         AddInLogger.Debug("AutoFitColumns 完成（含表头最长行 + 排序箭头余量）");
@@ -1513,21 +1515,32 @@ public class TextBatchEditForm : Form
         if (_grid != null) { _grid.Invalidate(); } // 触发 CellFormatting 重算脏/已保存底色
     }
 
-    /// <summary>底部左侧状态提示：未保存数量 / 全部已保存 / 自动保存状态。</summary>
+    /// <summary>底部左侧状态提示：未保存数量 / 全部已保存 / 自动保存状态；当前格在复选框列时附加“双击修改”。</summary>
     private void UpdateStatus(int dirtyCount)
     {
         if (_statusLabel == null) { return; }
         var auto = _autoSaveChk != null && _autoSaveChk.Checked;
+        string baseText;
+        System.Drawing.Color baseColor;
         if (dirtyCount > 0)
         {
-            _statusLabel.Text = "● " + dirtyCount + " 处未保存" + (auto ? "（将自动保存）" : string.Empty);
-            _statusLabel.ForeColor = System.Drawing.Color.FromArgb(190, 90, 0); // 醒目橙
+            baseText = "● " + dirtyCount + " 处未保存" + (auto ? "（将自动保存）" : string.Empty);
+            baseColor = System.Drawing.Color.FromArgb(190, 90, 0); // 醒目橙
         }
         else
         {
-            _statusLabel.Text = auto ? "自动保存已开启 · 全部已保存" : "已全部保存";
-            _statusLabel.ForeColor = System.Drawing.Color.FromArgb(60, 130, 70); // 绿
+            baseText = auto ? "自动保存已开启 · 全部已保存" : "已全部保存";
+            baseColor = System.Drawing.Color.FromArgb(60, 130, 70); // 绿
         }
+
+        // 当前格为可写复选框列时，在状态区常驻提示（无需 hover/popup）
+        var cur = _grid?.CurrentCell;
+        if (cur != null && cur.RowIndex >= 0 && IsNewCheckCol(cur.ColumnIndex))
+        {
+            baseText += "   ·   复选框双击修改";
+        }
+        _statusLabel.Text = baseText;
+        _statusLabel.ForeColor = baseColor;
     }
 
     /// <summary>开关“自动保存”：开启时把当前未保存内容安排一次写回；始终刷新状态。</summary>
@@ -1605,36 +1618,42 @@ public class TextBatchEditForm : Form
 
     private bool IsEditing() => _grid.IsCurrentCellInEditMode || _grid.EditingControl != null;
 
+    /// <summary>单击列头：选中该可见列的全部数据格（左上角头的全选仍由内置处理）。</summary>
+    private void SelectColumn(int colIndex)
+    {
+        if (colIndex < 0 || !_grid.Columns[colIndex].Visible) { return; }
+        _grid.ClearSelection();
+        var firstSet = false;
+        foreach (DataGridViewRow row in _grid.Rows)
+        {
+            if (!row.Visible) { continue; }
+            var cell = row.Cells[colIndex];
+            cell.Selected = true;
+            if (!firstSet) { _grid.CurrentCell = cell; firstSet = true; }
+        }
+    }
+
+    /// <summary>单击行头：选中该行的全部数据格。</summary>
+    private void SelectRow(int rowIndex)
+    {
+        if (rowIndex < 0) { return; }
+        _grid.ClearSelection();
+        var firstSet = false;
+        foreach (DataGridViewColumn col in _grid.Columns)
+        {
+            if (!col.Visible) { continue; }
+            var cell = _grid[col.Index, rowIndex];
+            cell.Selected = true;
+            if (!firstSet) { _grid.CurrentCell = cell; firstSet = true; }
+        }
+    }
+
+
     private bool IsNewValueCol(int col) =>
         col == _newTextCol || (col >= NewLangStart && col < NewLangStart + _projectLangs.Count);
 
     /// <summary>可编辑复选框列：新值侧“多语言 / 不自动翻译”。</summary>
     private bool IsNewCheckCol(int col) => col == ColMultilang || col == ColNoAutoTrans;
-
-    /// <summary>当前格为可写复选框列时，在其上方弹出“双击修改”，3 秒后自动消失；其他格立即收起。</summary>
-    private void ShowCheckBoxHint()
-    {
-        var cur = _grid.CurrentCell;
-        if (cur == null || cur.RowIndex < 0 || !IsNewCheckCol(cur.ColumnIndex))
-        {
-            _checkHintTimer.Stop();
-            _checkHint.Hide(_grid);
-            _lastHintRow = -1;
-            _lastHintCol = -1;
-            return;
-        }
-        if (_lastHintRow == cur.RowIndex && _lastHintCol == cur.ColumnIndex) { return; }
-        _lastHintRow = cur.RowIndex;
-        _lastHintCol = cur.ColumnIndex;
-
-        var rect = _grid.GetCellDisplayRectangle(cur.ColumnIndex, cur.RowIndex, false);
-        var x = rect.Left + 4;
-        var y = rect.Top - 24; // 显示在格子上方，不遮挡勾选框
-        if (y < 0) { y = rect.Bottom - 26; } // 首行上方空间不足时落在格内底部
-        _checkHint.Show("双击修改", _grid, x, y);
-        _checkHintTimer.Stop();
-        _checkHintTimer.Start();
-    }
 
     /// <summary>双击翻转一个可编辑复选框格；赋值后既有 CellValueChanged 会联动可编辑性/自动保存。</summary>
     private void ToggleCheckBoxCell(int row, int col)
