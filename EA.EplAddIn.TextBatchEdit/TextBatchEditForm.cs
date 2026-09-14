@@ -607,7 +607,8 @@ public class TextBatchEditForm : Form
                 "  • 绿色：已修改并保存（同上，被保存改动的格及其对应原值格、该行行号变绿）。\n\n" +
                 "【日志文件】\n" +
                 "  当前日志文件：\n" + AddInLogger.ActiveLogFilePath + "\n" +
-                "  路径取自工作站设置「系统消息」目录 + 版本号；取不到时回退到脚本目录/.log、DLL 旁 logs 或临时目录。",
+                "  路径取自工作站设置「系统消息」目录 + 版本号；取不到时回退到脚本目录/.log、DLL 旁 logs 或临时目录。\n" +
+                "  按大小滚动：单文件达 1 MB 另建带创建时间的新文件，最多保留 5 个，超出自动删最旧。",
             MaximumSize = new System.Drawing.Size(1080, 0), // 限宽自动换行，高度随内容增长
         };
         helpScroll.Controls.Add(help);
