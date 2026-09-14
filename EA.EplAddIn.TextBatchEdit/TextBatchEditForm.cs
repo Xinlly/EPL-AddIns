@@ -32,7 +32,6 @@ public class TextBatchEditForm : Form
     private static readonly System.Drawing.Color InfoHeaderGray = System.Drawing.Color.FromArgb(239, 239, 239);// 结构/坐标只读列（与列头同色）
     private static readonly System.Drawing.Color DirtyYellow = System.Drawing.Color.FromArgb(255, 242, 204);   // 已改未保存
     private static readonly System.Drawing.Color SavedGreen = System.Drawing.Color.FromArgb(221, 244, 223);     // 已改已保存
-    private static readonly System.Drawing.Color OrigChangedBlue = System.Drawing.Color.FromArgb(213, 232, 246);// 原值：对应新值已保存改动
     private static readonly System.Drawing.Color FocusTint = System.Drawing.Color.FromArgb(232, 242, 251);     // 单元格聚焦：所在行/列的极浅蓝
     private static readonly System.Drawing.Color FocusHeaderTint = System.Drawing.Color.FromArgb(217, 235, 248); // 单元格聚焦：列头/行首用略深浅蓝（在灰底上仍可辨）
 
@@ -491,9 +490,11 @@ public class TextBatchEditForm : Form
                 "  • 本窗口为浮动常驻窗口，打开时不抢焦点，可一边操作图形编辑器一边编辑；再次执行命令会回到已打开的窗口。\n\n" +
                 "【格子颜色】\n" +
                 "  • 灰色：只读，不能修改。\n" +
-                "  • 黄色：已修改、还没保存。\n" +
-                "  • 绿色：已修改并保存。\n" +
-                "  • 蓝色（原值列）：对应的新内容已保存且与原值不同。",
+                "  • 黄色：已修改、还没保存（同一行的原值列、行号列也跟随变黄）。\n" +
+                "  • 绿色：已修改并保存（同一行的原值列、行号列也跟随变绿）。\n\n" +
+                "【日志文件】\n" +
+                "  当前日志文件：\n" + AddInLogger.ActiveLogFilePath + "\n" +
+                "  解析过程：" + AddInLogger.ResolutionNote,
         };
         tabHelp.Controls.Add(help);
 
@@ -648,10 +649,10 @@ public class TextBatchEditForm : Form
         bool modifiedColor = false; // 本行本格是否承载“修改色”，聚焦高亮不得覆盖它
         if (IsOrigCol(col))
         {
-            var newCol = CorrespondingNewCol(col);
-            var origChanged = !CellIsDirty(row, newCol) && CellSavedChanged(row, newCol);
-            e.CellStyle!.BackColor = origChanged ? OrigChangedBlue : ReadOnlyGray;
-            modifiedColor = origChanged; // 原值列蓝=对应新值已保存改动
+            // 原值列底色完全跟随该行新值侧：有未保存→黄，否则有已保存改动→绿，否则只读灰
+            var rowColor = RowModificationColor(row);
+            e.CellStyle!.BackColor = rowColor ?? ReadOnlyGray;
+            modifiedColor = rowColor.HasValue;
         }
         else if (IsEditableStateCol(col))
         {
@@ -688,20 +689,28 @@ public class TextBatchEditForm : Form
         var isRowHeader = e.ColumnIndex == -1 && e.RowIndex >= 0;
         if (!isColHeader && !isRowHeader) { return; }
 
-        // ① 单元格聚焦：当前列头、当前行首也置浅蓝（左上角交叉格不处理）
-        bool tint = false;
-        if (_focusCellChk is { Checked: true })
+        var cur = _grid.CurrentCell;
+        var focusOn = _focusCellChk is { Checked: true };
+
+        // 行号列：修改底色完全跟随该行新值侧（黄=有未保存 / 绿=有已保存改动），优先级高于聚焦
+        System.Drawing.Color? bg = null;
+        if (isRowHeader && e.RowIndex < _baseline.Count)
         {
-            var cur = _grid.CurrentCell;
-            tint = cur != null
-                && ((isColHeader && e.ColumnIndex == cur.ColumnIndex)
-                    || (isRowHeader && e.RowIndex == cur.RowIndex));
+            bg = RowModificationColor(e.RowIndex);
         }
 
-        if (tint)
+        // 聚焦：当前列头、当前行首（左上角交叉格不处理）；行首已有修改色则不覆盖
+        if (bg == null && focusOn && cur != null
+            && ((isColHeader && e.ColumnIndex == cur.ColumnIndex)
+                || (isRowHeader && e.RowIndex == cur.RowIndex)))
         {
-            // 先自填聚焦底色，再让系统绘制边框/内容（含行首箭头、列头文字），但不重绘背景
-            using (var b = new System.Drawing.SolidBrush(FocusHeaderTint))
+            bg = FocusHeaderTint;
+        }
+
+        if (bg != null)
+        {
+            // 先自填底色，再让系统绘制边框/内容（含行首箭头、列头文字、行号），但不重绘背景
+            using (var b = new System.Drawing.SolidBrush(bg.Value))
             {
                 e.Graphics.FillRectangle(b, e.CellBounds);
             }
@@ -711,7 +720,7 @@ public class TextBatchEditForm : Form
             return;
         }
 
-        // ② 非聚焦底色：仅当前排序列列头需要在系统绘制后叠加箭头
+        // 无自定义底色：仅当前排序列列头需要在系统绘制后叠加箭头
         if (!isColHeader || _sortDir == 0 || e.ColumnIndex != _sortCol) { return; }
         e.Paint(e.ClipBounds, DataGridViewPaintParts.All);
         DrawSortArrow(e, true);
@@ -728,18 +737,6 @@ public class TextBatchEditForm : Form
         TextRenderer.DrawText(e.Graphics, arrow, arrowFont, rect,
             System.Drawing.Color.FromArgb(70, 70, 70),
             TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
-    }
-
-    private int CorrespondingNewCol(int origCol)
-    {
-        if (origCol == ColOrigMultilang) { return ColMultilang; }
-        if (origCol == ColOrigNoAuto) { return ColNoAutoTrans; }
-        if (origCol == _origTextCol) { return _newTextCol; }
-        foreach (var kv in _origLangCol)
-        {
-            if (kv.Value == origCol) { return _newLangCol[kv.Key]; }
-        }
-        return -1;
     }
 
     /// <summary>把某一“新值状态列”归约为可比较的字符串（标志位或某语言文本）。</summary>
@@ -765,6 +762,22 @@ public class TextBatchEditForm : Form
 
     private bool CellSavedChanged(int row, int col) =>
         CurrentCellValue(row, col) != StateValue(_initial[row], col);
+
+    /// <summary>
+    /// 该行“新值侧”整体修改色：任一新值格未保存→黄（优先）；否则任一已保存且变了→绿；都没有→null。
+    /// 供原值列与行号列“完全跟随新值列”上色。
+    /// </summary>
+    private System.Drawing.Color? RowModificationColor(int row)
+    {
+        var saved = false;
+        for (var c = 0; c < _grid.Columns.Count; c++)
+        {
+            if (!IsEditableStateCol(c)) { continue; }
+            if (CellIsDirty(row, c)) { return DirtyYellow; }
+            if (CellSavedChanged(row, c)) { saved = true; }
+        }
+        return saved ? SavedGreen : (System.Drawing.Color?)null;
+    }
 
     private static RowState CloneRow(RowState s) => new()
     {
