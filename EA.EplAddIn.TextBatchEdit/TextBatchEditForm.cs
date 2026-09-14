@@ -63,6 +63,45 @@ public class TextBatchEditForm : Form
     private readonly Dictionary<string, double> _placeRank = new();
     private readonly Dictionary<string, double> _locationRank = new();
 
+    // Ctrl+滚轮缩放：基准字体 + 当前缩放因子（1.0=原始）+ 当前应用的自定义字体（用于释放）
+    private Font? _baseGridFont;
+    private Font? _appliedGridFont;
+    private float _zoom = 1f;
+    private const float ZoomMin = 0.7f, ZoomMax = 1.8f, ZoomStep = 0.1f;
+
+    /// <summary>Ctrl+滚轮：以光标为中心整体缩放表格字体、列宽、行高（行号列宽随字体自适应）。</summary>
+    private void ZoomGrid(bool zoomIn)
+    {
+        var newZoom = _zoom + (zoomIn ? ZoomStep : -ZoomStep);
+        if (newZoom < ZoomMin - 0.001f) { newZoom = ZoomMin; }
+        if (newZoom > ZoomMax + 0.001f) { newZoom = ZoomMax; }
+        if (Math.Abs(newZoom - _zoom) < 0.001f) { return; }
+
+        _baseGridFont ??= _grid.Font; // 首次缩放时记录原始字体（不释放它）
+        var ratio = newZoom / _zoom;
+
+        // 列宽、行高相对当前值按比例缩放（不缓存绝对值，重载/自适应后仍可继续缩放）
+        foreach (DataGridViewColumn col in _grid.Columns)
+        {
+            if (!col.Visible) { continue; }
+            col.Width = Math.Max(20, (int)Math.Round(col.Width * ratio));
+        }
+        foreach (DataGridViewRow row in _grid.Rows)
+        {
+            row.Height = Math.Max(14, (int)Math.Round(row.Height * ratio));
+        }
+
+        // 字体按基准字体 × 因子重建（表头/编辑控件均继承 grid.Font）
+        var old = _appliedGridFont;
+        _appliedGridFont = new Font(_baseGridFont.FontFamily, _baseGridFont.Size * newZoom,
+            _baseGridFont.Style, _baseGridFont.Unit, _baseGridFont.GdiCharSet, _baseGridFont.GdiVerticalFont);
+        _grid.Font = _appliedGridFont;
+        old?.Dispose();
+
+        _zoom = newZoom;
+    }
+
+
     /// <summary>一行只读结构/坐标信息，同时承担“默认排序”的键。</summary>
     private sealed class RowMeta
     {
@@ -155,6 +194,8 @@ public class TextBatchEditForm : Form
         DisposeAutoSaveTimer();
         if (_keyFilter != null) { Application.RemoveMessageFilter(_keyFilter); _keyFilter = null; }
         if (_clipFilter != null) { Application.RemoveMessageFilter(_clipFilter); _clipFilter = null; }
+        _appliedGridFont?.Dispose(); // 仅释放缩放时新建的字体；基准字体是系统默认字体，不释放
+        _appliedGridFont = null;
         base.OnFormClosed(e);
     }
 
@@ -394,6 +435,7 @@ public class TextBatchEditForm : Form
             else { PasteClipboard(); }
         };
         _grid.IsGridEditing = IsEditing;
+        _grid.ZoomGrid = ZoomGrid;
         _grid.CellFormatting += GridOnCellFormatting; // 统一单元格状态着色
         _grid.CurrentCellChanged += (_, _) =>
         {
@@ -595,12 +637,14 @@ public class TextBatchEditForm : Form
                 "  • 可像 Excel 一样框选后复制、剪切、粘贴、删除（快捷键 Ctrl+C/X/V、Delete，或右键菜单）。\n" +
                 "  • 粘贴同 Excel：只选中一个格时，从该格起直接铺下整块内容；选中多格时在选区内按行列整除重复，\n" +
                 "    不能整除会提示不匹配。\n" +
+                "    进入单元格编辑后粘贴多行文本，会自动把换行转成 ¶ 放进同一个格（不拆分到其他行）。\n" +
                 "  • 复选框需双击才切换（单击只选中；选中后底部状态栏提示“复选框双击修改”）；复制为 TRUE/FALSE，粘贴时 TRUE/1/是/√等识别为勾选。\n" +
                 "  • 单击列头选中整列、单击行号选中整行、点左上角格选中全表；可在此基础上复制/清除。\n" +
                 "  • 关闭某行“多语言”时，非源语言译文会暂存并清空；重新开启时自动写回，避免切换丢值。\n" +
                 "  • 右键“还原选中的行/还原当前值”可恢复到打开窗口时的原值（即使已保存也可还原，再保存即写回）。\n\n" +
                 "【窗口用法】\n" +
-                "  • 本窗口为浮动常驻窗口，打开时不抢焦点，可一边操作图形编辑器一边编辑；再次执行命令会回到已打开的窗口。\n\n" +
+                "  • 本窗口为浮动常驻窗口，打开时不抢焦点，可一边操作图形编辑器一边编辑；再次执行命令会回到已打开的窗口。\n" +
+                "  • 按住 Ctrl 滚动鼠标滚轮可放大/缩小表格字体、行高与列宽（0.7～1.8 倍）。\n\n" +
                 "【格子颜色】\n" +
                 "  • 灰色：只读，不能修改。\n" +
                 "  • 黄色：已修改、还没保存（被改的新值格、其正左对应的原值格，以及该行行号变黄）。\n" +
@@ -2252,6 +2296,19 @@ public class TextBatchEditForm : Form
     {
         public Action<Keys>? GridClipboardCommand;
         public Func<bool>? IsGridEditing;
+        public Action<bool>? ZoomGrid; // 参数：true=放大，false=缩小
+
+        protected override void OnMouseWheel(MouseEventArgs e)
+        {
+            // Ctrl+滚轮：缩放表格与字体，不滚动
+            if ((Control.ModifierKeys & Keys.Control) == Keys.Control && ZoomGrid != null)
+            {
+                if (e is HandledMouseEventArgs he) { he.Handled = true; }
+                ZoomGrid.Invoke(e.Delta > 0);
+                return;
+            }
+            base.OnMouseWheel(e);
+        }
 
         protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
         {
@@ -2324,6 +2381,25 @@ public class TextBatchEditForm : Form
                 e.Handled = true;
                 e.SuppressKeyPress = true;
                 return;
+            }
+            // 编辑态粘贴：剪贴板为多行文本时，把真实换行转成 ¶ 插入当前格（区别于选区粘贴的整块铺入）；
+            // 单行文本不拦截，交给系统默认粘贴。
+            if (e.Control && e.KeyCode == Keys.V && Clipboard.ContainsText())
+            {
+                var raw = Clipboard.GetText();
+                if (raw.IndexOf('\r') >= 0 || raw.IndexOf('\n') >= 0)
+                {
+                    var converted = raw.Replace("\r\n", "\n").Replace('\r', '\n').TrimEnd('\n');
+                    converted = converted.Replace('\n', Marker[0]);
+                    var caret = SelectionStart;
+                    var sel = SelectionLength;
+                    Text = Text.Remove(caret, sel).Insert(caret, converted);
+                    SelectionStart = caret + converted.Length;
+                    SelectionLength = 0;
+                    e.Handled = true;
+                    e.SuppressKeyPress = true;
+                    return;
+                }
             }
             base.OnKeyDown(e);
         }
