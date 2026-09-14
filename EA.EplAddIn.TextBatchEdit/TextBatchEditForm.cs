@@ -2382,26 +2382,26 @@ public class TextBatchEditForm : Form
                 e.SuppressKeyPress = true;
                 return;
             }
-            // 编辑态粘贴：剪贴板为多行文本时，把真实换行转成 ¶ 插入当前格（区别于选区粘贴的整块铺入）；
-            // 单行文本不拦截，交给系统默认粘贴。
-            if (e.Control && e.KeyCode == Keys.V && Clipboard.ContainsText())
+            base.OnKeyDown(e);
+        }
+
+        // Ctrl+V / 右键粘贴 / Shift+Insert 在文本框里最终都发 WM_PASTE（Ctrl+V 由 ProcessCmdKey 直接处理，
+        // 不产生 KeyDown，故必须在这里拦截）。多行剪贴板文本把真实换行转成 ¶ 后插入同一格；单行不拦截。
+        protected override void WndProc(ref Message m)
+        {
+            const int WM_PASTE = 0x0302;
+            if (m.Msg == WM_PASTE && Clipboard.ContainsText())
             {
                 var raw = Clipboard.GetText();
                 if (raw.IndexOf('\r') >= 0 || raw.IndexOf('\n') >= 0)
                 {
                     var converted = raw.Replace("\r\n", "\n").Replace('\r', '\n').TrimEnd('\n');
                     converted = converted.Replace('\n', Marker[0]);
-                    var caret = SelectionStart;
-                    var sel = SelectionLength;
-                    Text = Text.Remove(caret, sel).Insert(caret, converted);
-                    SelectionStart = caret + converted.Length;
-                    SelectionLength = 0;
-                    e.Handled = true;
-                    e.SuppressKeyPress = true;
-                    return;
+                    SelectedText = converted; // 替换当前选区并把光标移到插入内容之后
+                    return;                   // 吞掉默认粘贴，避免多行只进第一行
                 }
             }
-            base.OnKeyDown(e);
+            base.WndProc(ref m);
         }
     }
 
