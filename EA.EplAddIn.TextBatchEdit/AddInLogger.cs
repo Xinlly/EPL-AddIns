@@ -7,22 +7,18 @@ namespace EA.EplAddIn.TextBatchEdit;
 
 /// <summary>
 /// 轻量文件日志：DEBUG / INFO / WARN / ERROR 四级，按天一个文件。
-/// 当前写盘目录写死为系统消息路径下的绝对目录（临时方案，便于在 2.9 平台稳定落盘）；
-/// 从工作站设置 STATION.SYSTEMERROR.LOGFILEPATH + $(EPLAN_VERSION) 动态计算的路径仅在“说明”页预览，
-/// 待动态路径实测稳定后再切换为正式写盘路径。动态路径的解析过程写入本日志文件。
+/// 写盘目录优先取工作站设置 STATION.SystemError.LogFilePath + $(EPLAN_VERSION)
+/// （…\EA.EplAddIn\&lt;版本&gt;\TextBatchEdit\）；取不到或不可写时回退
+/// $(MD_SCRIPTS)\.log → DLL 旁 logs\ → %TEMP%。解析过程写入本日志文件开头。
 /// </summary>
 public static class AddInLogger
 {
     private const int MinLevel = 0; // 0=Debug 1=Info 2=Warn 3=Error
     private static readonly object LockObj = new object();
 
-    // —— 临时写死的绝对目录（系统消息路径 C:\Users\Public\EPLAN\Electric P8 + EA.EplAddIn\2.9.4\TextBatchEdit）——
-    private const string FixedBaseDir = @"C:\Users\Public\EPLAN\Electric P8";
-    private const string FixedVersion = "2.9.4";
-
     private static readonly string LogDirectory = ResolveLogDirectory();
     private static string DynamicNote = "";     // 动态路径解析过程（写入日志）
-    private static string? DynamicFilePath;    // 动态路径预览（仅说明页展示，不写盘）
+    private static string? DynamicFilePath;    // 动态路径计算结果
 
     /// <summary>当前实际写入的日志目录。</summary>
     public static string DirectoryPath => LogDirectory;
@@ -31,7 +27,7 @@ public static class AddInLogger
     public static string ActiveLogFilePath =>
         Path.Combine(LogDirectory, "addin-" + DateTime.Now.ToString("yyyy-MM-dd") + ".log");
 
-    /// <summary>动态计算得到的候选日志文件路径（暂不启用，仅说明页预览）；不可用时为 null。</summary>
+    /// <summary>按工作站设置动态计算出的日志文件路径（与首选写盘路径一致）；不可用时为 null。</summary>
     public static string? PreviewLogFilePath => DynamicFilePath;
 
     public static void Debug(string message) => Write("DEBUG", message, null);
@@ -42,23 +38,25 @@ public static class AddInLogger
 
     private static string ResolveLogDirectory()
     {
-        // 先算动态候选（仅预览 + 诊断），不参与写盘决策
+        // 1) 首选：工作站设置 + 版本号的动态路径
         DynamicFilePath = TryComputeDynamicPath(out var note);
         DynamicNote = note;
-
-        // 1) 写死的绝对目录
-        var preferred = Path.Combine(FixedBaseDir, "EA.EplAddIn", FixedVersion, "TextBatchEdit");
-        try
+        if (DynamicFilePath != null)
         {
-            if (TryWritable(preferred))
+            var preferred = Path.GetDirectoryName(DynamicFilePath);
+            try
             {
-                EmitStartupDiagnostic(preferred);
-                return preferred;
+                if (!string.IsNullOrEmpty(preferred) && TryWritable(preferred!))
+                {
+                    EmitStartupDiagnostic(preferred!, "动态路径（工作站设置 STATION.SystemError.LogFilePath）");
+                    return preferred!;
+                }
+                DynamicNote += " 动态目录不可写，进入回退。";
             }
-        }
-        catch (Exception ex)
-        {
-            DynamicNote += " 写死目录不可用：" + ex.Message + "。";
+            catch (Exception ex)
+            {
+                DynamicNote += " 动态目录异常：" + ex.Message + "，进入回退。";
+            }
         }
 
         // 2) 回退 $(MD_SCRIPTS)\.log
@@ -70,7 +68,7 @@ public static class AddInLogger
                 var alt = Path.Combine(mdScripts, ".log");
                 if (TryWritable(alt))
                 {
-                    EmitStartupDiagnostic(alt);
+                    EmitStartupDiagnostic(alt, "回退路径（$(MD_SCRIPTS)\\.log）");
                     return alt;
                 }
             }
@@ -85,7 +83,7 @@ public static class AddInLogger
                 "logs");
             if (TryWritable(dllDir))
             {
-                EmitStartupDiagnostic(dllDir);
+                EmitStartupDiagnostic(dllDir, "回退路径（DLL 旁 logs\\）");
                 return dllDir;
             }
         }
@@ -94,7 +92,7 @@ public static class AddInLogger
         // 4) 临时目录
         var fallback = Path.Combine(Path.GetTempPath(), "EA.EplAddIn.TextBatchEdit", "logs");
         Directory.CreateDirectory(fallback);
-        EmitStartupDiagnostic(fallback);
+        EmitStartupDiagnostic(fallback, "回退路径（%TEMP%）");
         return fallback;
     }
 
@@ -136,14 +134,15 @@ public static class AddInLogger
         return null;
     }
 
-    /// <summary>把“实际写盘路径 + 动态候选 + 解析过程”作为首条诊断写进日志文件。</summary>
-    private static void EmitStartupDiagnostic(string activeDir)
+    /// <summary>把“实际写盘路径 + 动态计算结果 + 解析过程”作为首条诊断写进日志文件。</summary>
+    private static void EmitStartupDiagnostic(string activeDir, string source)
     {
         try
         {
             var line = "========== 日志路径诊断 ==========" + Environment.NewLine
                      + "实际写盘目录：" + activeDir + Environment.NewLine
-                     + "动态候选文件（暂未启用）：" + (DynamicFilePath ?? "(不可用)") + Environment.NewLine
+                     + "路径来源：" + source + Environment.NewLine
+                     + "动态计算文件：" + (DynamicFilePath ?? "(不可用)") + Environment.NewLine
                      + "动态路径解析过程：" + DynamicNote + Environment.NewLine
                      + "==================================";
             var path = Path.Combine(activeDir, "addin-" + DateTime.Now.ToString("yyyy-MM-dd") + ".log");

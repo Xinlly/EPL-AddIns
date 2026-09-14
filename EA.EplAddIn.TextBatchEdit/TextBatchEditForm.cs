@@ -26,6 +26,8 @@ public class TextBatchEditForm : Form
     private readonly List<RowState> _baseline = new();
     // 开窗时的初始值，用于标识“已保存但相对原值有改动”的单元格
     private readonly List<RowState> _initial = new();
+    // 每行“多语言暂存”：关闭多语言时把非源语言译文暂存于此并清空新值，重新开启时写回（仅会话内，不参与保存）
+    private readonly List<Dictionary<ISOCode.Language, string>> _stash = new();
 
     // 单元格状态配色
     private static readonly System.Drawing.Color ReadOnlyGray = System.Drawing.Color.FromArgb(225, 225, 225);  // 只读原值（加深）
@@ -301,15 +303,31 @@ public class TextBatchEditForm : Form
             {
                 var toMultilang = Convert.ToBoolean(_grid[ColMultilang, e.RowIndex].Value ?? false);
                 SetRowEditable(e.RowIndex, toMultilang);
-                // 切到非多语言：单语言 Contents 落库只保留源语言串，故清空非源语言“新值”格，
-                // 否则这些只读格仍显示旧译文，而保存快照不再收录它们 → 永远判脏（保存后也黄）。
-                // 原值侧列不清空，保留作对照；误操作可用右键“还原”恢复。
-                if (!toMultilang)
+                // 多语言暂存：关闭时非源语言“新值”入暂存并清空（落库为单语言，只保留源语言串）；
+                // 重新开启时把暂存写回，避免切换过程丢失译文。原值侧列保留旧译文作对照。
+                if (e.RowIndex < _stash.Count)
                 {
+                    var stash = _stash[e.RowIndex];
                     foreach (var lang in _projectLangs)
                     {
                         if (lang == _sourceLang) { continue; }
-                        _grid[_newLangCol[lang], e.RowIndex].Value = string.Empty;
+                        var col = _newLangCol[lang];
+                        var v = _grid[col, e.RowIndex].Value as string ?? string.Empty;
+                        if (toMultilang)
+                        {
+                            // 开启：暂存写回新值（有暂存才覆盖，避免把已填译文抹空）
+                            if (stash.TryGetValue(lang, out var saved) && saved.Length > 0)
+                            {
+                                _grid[col, e.RowIndex].Value = saved;
+                            }
+                        }
+                        else
+                        {
+                            // 关闭：新值入暂存（仅非空）并清空
+                            if (v.Length > 0) { stash[lang] = v; }
+                            else { stash.Remove(lang); }
+                            _grid[col, e.RowIndex].Value = string.Empty;
+                        }
                     }
                 }
                 AddInLogger.Debug("行" + (e.RowIndex + 1) + " 多语言复选框=" + toMultilang);
@@ -347,21 +365,20 @@ public class TextBatchEditForm : Form
         _grid.KeyDown += GridOnKeyDown;
         _grid.ColumnHeaderMouseDoubleClick += GridOnHeaderDoubleClick; // 双击表头：顺序/倒序/默认
         _grid.CellMouseDown += GridOnCellMouseDown;
-        // 悬浮在可编辑复选框格上提示“双击修改”
+        // 悬浮在可编辑复选框格上提示“双击修改”（复选框列恒 ReadOnly，靠 IsNewCheckCol 识别可写）
         _grid.CellToolTipTextNeeded += (_, e) =>
         {
-            if (e.RowIndex >= 0 && e.ColumnIndex >= 0
-                && IsNewCheckCol(e.ColumnIndex) && !_grid[e.ColumnIndex, e.RowIndex].ReadOnly)
+            if (e.RowIndex >= 0 && e.ColumnIndex >= 0 && IsNewCheckCol(e.ColumnIndex))
             {
                 e.ToolTipText = "双击修改";
             }
         };
-        // 双击：文本格直接进入编辑；可编辑复选框格则翻转勾选（单击只选中，防误触）
+        // 双击：可写复选框格翻转勾选（列恒 ReadOnly，单击/空格均不翻转）；文本格直接进入编辑
         _grid.CellDoubleClick += (_, e) =>
         {
             if (e.RowIndex < 0 || e.ColumnIndex < 0) { return; }
             var cell = _grid[e.ColumnIndex, e.RowIndex];
-            if (IsNewCheckCol(e.ColumnIndex) && !cell.ReadOnly)
+            if (IsNewCheckCol(e.ColumnIndex))
             {
                 ToggleCheckBoxCell(e.RowIndex, e.ColumnIndex);
             }
@@ -455,10 +472,10 @@ public class TextBatchEditForm : Form
             _origLangCol[lang] = idx;
         }
 
-        // —— 新值侧复选框（可编辑）：单击只选中、双击才切换，防止误操作 ——
-        _grid.Columns.Add(new DoubleClickCheckBoxColumn { Name = "multilang", HeaderText = "多语言", Width = 60 });
+        // —— 新值侧复选框：ReadOnly 彻底禁止单击/空格翻转（框架层 BeginEdit 被拦），双击由代码翻转 ——
+        _grid.Columns.Add(new DataGridViewCheckBoxColumn { Name = "multilang", HeaderText = "多语言", Width = 60, ReadOnly = true });
         _grid.Columns[ColMultilang].SortMode = DataGridViewColumnSortMode.NotSortable;
-        _grid.Columns.Add(new DoubleClickCheckBoxColumn { Name = "noAutoTrans", HeaderText = "不自动翻译", Width = 84 });
+        _grid.Columns.Add(new DataGridViewCheckBoxColumn { Name = "noAutoTrans", HeaderText = "不自动翻译", Width = 84, ReadOnly = true });
         _grid.Columns[ColNoAutoTrans].SortMode = DataGridViewColumnSortMode.NotSortable;
 
         // —— 新值列（可编辑）——
@@ -580,6 +597,7 @@ public class TextBatchEditForm : Form
                 "  • 粘贴同 Excel：只选中一个格时，从该格起直接铺下整块内容；选中多格时在选区内按行列整除重复，\n" +
                 "    不能整除会提示不匹配。\n" +
                 "  • 复选框需双击才切换（单击只选中，悬停提示“双击修改”）；复制为 TRUE/FALSE，粘贴时 TRUE/1/是/√等识别为勾选。\n" +
+                "  • 关闭某行“多语言”时，非源语言译文会暂存并清空；重新开启时自动写回，避免切换丢值。\n" +
                 "  • 右键“还原选中的行/还原当前值”可恢复到打开窗口时的原值（即使已保存也可还原，再保存即写回）。\n\n" +
                 "【窗口用法】\n" +
                 "  • 本窗口为浮动常驻窗口，打开时不抢焦点，可一边操作图形编辑器一边编辑；再次执行命令会回到已打开的窗口。\n\n" +
@@ -588,8 +606,8 @@ public class TextBatchEditForm : Form
                 "  • 黄色：已修改、还没保存（被改的新值格、其正左对应的原值格，以及该行行号变黄）。\n" +
                 "  • 绿色：已修改并保存（同上，被保存改动的格及其对应原值格、该行行号变绿）。\n\n" +
                 "【日志文件】\n" +
-                "  当前实际写盘：\n" + AddInLogger.ActiveLogFilePath + "\n" +
-                "  动态路径预览（暂未启用，实测正常后切换）：\n" + (AddInLogger.PreviewLogFilePath ?? "(当前环境取不到，详见日志文件内诊断)"),
+                "  当前日志文件：\n" + AddInLogger.ActiveLogFilePath + "\n" +
+                "  路径取自工作站设置「系统消息」目录 + 版本号；取不到时回退到脚本目录/.log、DLL 旁 logs 或临时目录。",
             MaximumSize = new System.Drawing.Size(1080, 0), // 限宽自动换行，高度随内容增长
         };
         helpScroll.Controls.Add(help);
@@ -756,8 +774,8 @@ public class TextBatchEditForm : Form
         {
             if (CellIsDirty(row, col)) { e.CellStyle!.BackColor = DirtyYellow; modifiedColor = true; }
             else if (CellSavedChanged(row, col)) { e.CellStyle!.BackColor = SavedGreen; modifiedColor = true; }
-            else if (_grid[col, row].ReadOnly) { e.CellStyle!.BackColor = ReadOnlyGray; }
-            // else 保持默认白底
+            else if (_grid[col, row].ReadOnly && !IsNewCheckCol(col)) { e.CellStyle!.BackColor = ReadOnlyGray; }
+            // 复选框列虽恒 ReadOnly（为禁单击翻转）但视觉上是可写格，保持默认白底；else 同上
         }
 
         // 2) 单元格聚焦：当前格所在行/列（排除当前格本身）整体置极浅蓝；承载修改色的格子不覆盖
@@ -1199,6 +1217,7 @@ public class TextBatchEditForm : Form
 
         _baseline.Clear();
         _initial.Clear();
+        _stash.Clear();
         _origIndex.Clear();
         _meta.Clear();
         BuildRankMaps();
@@ -1308,6 +1327,7 @@ public class TextBatchEditForm : Form
                 var snap = SnapshotRow(rowIdx);
                 _baseline.Add(snap);
                 _initial.Add(CloneRow(snap));
+                _stash.Add(new Dictionary<ISOCode.Language, string>());
                 _origIndex.Add(i);
             }
         }
@@ -1335,6 +1355,7 @@ public class TextBatchEditForm : Form
         public TextBase T = null!;
         public RowState Base = null!;
         public RowState Init = null!;
+        public Dictionary<ISOCode.Language, string> Stash = null!;
         public int Orig;
         public RowMeta Meta = null!;
     }
@@ -1358,6 +1379,7 @@ public class TextBatchEditForm : Form
                 T = _texts[i],
                 Base = _baseline[i],
                 Init = _initial[i],
+                Stash = _stash[i],
                 Orig = _origIndex[i],
                 Meta = _meta[i],
             });
@@ -1415,6 +1437,7 @@ public class TextBatchEditForm : Form
             _texts[i] = sorted[i].T;
             _baseline[i] = sorted[i].Base;
             _initial[i] = sorted[i].Init;
+            _stash[i] = sorted[i].Stash;
             _origIndex[i] = sorted[i].Orig;
             _meta[i] = sorted[i].Meta;
         }
@@ -1620,6 +1643,13 @@ public class TextBatchEditForm : Form
     /// <summary>用户可写的列：新值文本列 + 新值复选框列。</summary>
     private bool IsWritableCol(int col) => IsNewValueCol(col) || IsNewCheckCol(col);
 
+    /// <summary>
+    /// 某格当前是否允许用户写：新值复选框列恒可写（列本身 ReadOnly 只为禁单击翻转，双击/粘贴可改）；
+    /// 文本列则要求非只读（非源语言在单语言态只读）。
+    /// </summary>
+    private bool IsCellUserWritable(DataGridViewCell c) =>
+        IsNewCheckCol(c.ColumnIndex) || (IsNewValueCol(c.ColumnIndex) && !c.ReadOnly);
+
     /// <summary>把粘贴文本解析为勾选状态：TRUE/1/YES/ON/是/✓/√/×/x（忽略大小写与空白）视为勾选。</summary>
     private static bool ParseCheckToken(string? s)
     {
@@ -1630,7 +1660,7 @@ public class TextBatchEditForm : Form
 
     private List<DataGridViewCell> EditableSelectedCells() =>
         _grid.SelectedCells.Cast<DataGridViewCell>()
-            .Where(c => c.RowIndex >= 0 && !c.ReadOnly && IsWritableCol(c.ColumnIndex))
+            .Where(c => c.RowIndex >= 0 && IsCellUserWritable(c))
             .ToList();
 
     private void CopySelection()
@@ -1811,6 +1841,8 @@ public class TextBatchEditForm : Form
         _grid[_newTextCol, row].Value = src;
         _grid[_newLangCol[_sourceLang], row].Value = src;
         SetRowEditable(row, s.Multilang);
+        // 整行已按目标状态重建：丢弃此前的多语言暂存，避免之后开启时用旧译文覆盖
+        if (row < _stash.Count) { _stash[row].Clear(); }
     }
 
     private void PasteClipboard()
@@ -1827,9 +1859,9 @@ public class TextBatchEditForm : Form
         var sc = src.Max(r => r.Count);
         foreach (var r in src) { while (r.Count < sc) { r.Add(string.Empty); } }
 
-        // 选中且可写的目标格
+        // 选中且可写的目标格（复选框列恒可写，文本列要求非只读）
         var targetCells = _grid.SelectedCells.Cast<DataGridViewCell>()
-            .Where(c => c.RowIndex >= 0 && IsWritableCol(c.ColumnIndex) && !c.ReadOnly)
+            .Where(c => c.RowIndex >= 0 && IsCellUserWritable(c))
             .ToList();
         if (targetCells.Count == 0)
         {
@@ -1853,7 +1885,7 @@ public class TextBatchEditForm : Form
                 {
                     var colIdx = anchor.ColumnIndex + ci;
                     if (colIdx < 0 || colIdx >= _grid.Columns.Count
-                        || !IsWritableCol(colIdx) || _grid[colIdx, rowIdx].ReadOnly) { continue; }
+                        || !IsCellUserWritable(_grid[colIdx, rowIdx])) { continue; }
                     WritePasteCell(_grid[colIdx, rowIdx], src[ri][ci]);
                     pasted++;
                 }
@@ -2222,28 +2254,6 @@ public class TextBatchEditForm : Form
                 return;
             }
             base.OnKeyDown(e);
-        }
-    }
-
-    /// <summary>
-    /// 复选框单元格：单击不翻转（默认翻转发生在 OnMouseUp 的 PushCheckBox），左键抬起时直接吞掉，
-    /// 单击仅用于选中格；真正翻转由表格 CellDoubleClick 处理。右键/其他键仍交默认（弹菜单等）。
-    /// </summary>
-    private class DoubleClickCheckBoxCell : DataGridViewCheckBoxCell
-    {
-        protected override void OnMouseUp(DataGridViewCellMouseEventArgs e)
-        {
-            if (e.Button == MouseButtons.Left) { return; } // 吞掉左键，阻止单击即勾选
-            base.OnMouseUp(e);
-        }
-    }
-
-    /// <summary>使用 DoubleClickCheckBoxCell 作为模板的复选框列。</summary>
-    private class DoubleClickCheckBoxColumn : DataGridViewCheckBoxColumn
-    {
-        public DoubleClickCheckBoxColumn()
-        {
-            CellTemplate = new DoubleClickCheckBoxCell();
         }
     }
 
