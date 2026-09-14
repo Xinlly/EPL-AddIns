@@ -34,6 +34,7 @@ public class TextBatchEditForm : Form
     private static readonly System.Drawing.Color SavedGreen = System.Drawing.Color.FromArgb(221, 244, 223);     // 已改已保存
     private static readonly System.Drawing.Color OrigChangedBlue = System.Drawing.Color.FromArgb(213, 232, 246);// 原值：对应新值已保存改动
     private static readonly System.Drawing.Color FocusTint = System.Drawing.Color.FromArgb(232, 242, 251);     // 单元格聚焦：所在行/列的极浅蓝
+    private static readonly System.Drawing.Color FocusHeaderTint = System.Drawing.Color.FromArgb(217, 235, 248); // 单元格聚焦：列头/行首用略深浅蓝（在灰底上仍可辨）
 
     private DataGridView _grid = null!;
     private CheckBox _showOrigChk = null!;
@@ -644,22 +645,24 @@ public class TextBatchEditForm : Form
         if (row < 0 || row >= _baseline.Count) { return; }
 
         // 1) 先定基础状态色（结构/坐标等只读信息列不进下面两支，保留列默认灰）
+        bool modifiedColor = false; // 本行本格是否承载“修改色”，聚焦高亮不得覆盖它
         if (IsOrigCol(col))
         {
             var newCol = CorrespondingNewCol(col);
-            e.CellStyle!.BackColor =
-                (!CellIsDirty(row, newCol) && CellSavedChanged(row, newCol)) ? OrigChangedBlue : ReadOnlyGray;
+            var origChanged = !CellIsDirty(row, newCol) && CellSavedChanged(row, newCol);
+            e.CellStyle!.BackColor = origChanged ? OrigChangedBlue : ReadOnlyGray;
+            modifiedColor = origChanged; // 原值列蓝=对应新值已保存改动
         }
         else if (IsEditableStateCol(col))
         {
-            if (CellIsDirty(row, col)) { e.CellStyle!.BackColor = DirtyYellow; }
-            else if (CellSavedChanged(row, col)) { e.CellStyle!.BackColor = SavedGreen; }
+            if (CellIsDirty(row, col)) { e.CellStyle!.BackColor = DirtyYellow; modifiedColor = true; }
+            else if (CellSavedChanged(row, col)) { e.CellStyle!.BackColor = SavedGreen; modifiedColor = true; }
             else if (_grid[col, row].ReadOnly) { e.CellStyle!.BackColor = ReadOnlyGray; }
             // else 保持默认白底
         }
 
-        // 2) 单元格聚焦：当前格所在行/列（排除当前格本身）整体置极浅蓝，覆盖在状态色之上
-        if (_focusCellChk is { Checked: true })
+        // 2) 单元格聚焦：当前格所在行/列（排除当前格本身）整体置极浅蓝；承载修改色的格子不覆盖
+        if (!modifiedColor && _focusCellChk is { Checked: true })
         {
             var cur = _grid.CurrentCell;
             if (cur != null)
@@ -678,24 +681,53 @@ public class TextBatchEditForm : Form
         col == ColOrigMultilang || col == ColOrigNoAuto ||
         col == _origTextCol || _origLangCol.ContainsValue(col);
 
-    // —— 自绘列头排序箭头：默认渲染后，在当前排序列表头右侧叠一个实心三角（系统 glyph 在自定义样式下会渲染成斜杠）——
+    // —— 自绘：①聚焦时给当前列头/行首上浅蓝；②当前排序列列头右侧叠加 ▲/▼ 字符 ——
     private void GridOnCellPainting(object? sender, DataGridViewCellPaintingEventArgs e)
     {
-        // 只处理“列头”且“当前排序列”
-        if (e.RowIndex != -1 || _sortDir == 0 || e.ColumnIndex != _sortCol) { return; }
+        var isColHeader = e.RowIndex == -1 && e.ColumnIndex >= 0;
+        var isRowHeader = e.ColumnIndex == -1 && e.RowIndex >= 0;
+        if (!isColHeader && !isRowHeader) { return; }
 
-        // 先让系统照常绘制背景/边框/文字（文字已下部居中），再叠加箭头字符
+        // ① 单元格聚焦：当前列头、当前行首也置浅蓝（左上角交叉格不处理）
+        bool tint = false;
+        if (_focusCellChk is { Checked: true })
+        {
+            var cur = _grid.CurrentCell;
+            tint = cur != null
+                && ((isColHeader && e.ColumnIndex == cur.ColumnIndex)
+                    || (isRowHeader && e.RowIndex == cur.RowIndex));
+        }
+
+        if (tint)
+        {
+            // 先自填聚焦底色，再让系统绘制边框/内容（含行首箭头、列头文字），但不重绘背景
+            using (var b = new System.Drawing.SolidBrush(FocusHeaderTint))
+            {
+                e.Graphics.FillRectangle(b, e.CellBounds);
+            }
+            e.Paint(e.ClipBounds, DataGridViewPaintParts.All & ~DataGridViewPaintParts.Background);
+            DrawSortArrow(e, isColHeader);
+            e.Handled = true;
+            return;
+        }
+
+        // ② 非聚焦底色：仅当前排序列列头需要在系统绘制后叠加箭头
+        if (!isColHeader || _sortDir == 0 || e.ColumnIndex != _sortCol) { return; }
         e.Paint(e.ClipBounds, DataGridViewPaintParts.All);
+        DrawSortArrow(e, true);
+        e.Handled = true;
+    }
 
-        // 用箭头字符替代自绘多边形（自绘三角在某些 DPI 下看起来是歪的）
+    /// <summary>在列头右侧绘制当前排序方向箭头（▲/▼）。</summary>
+    private void DrawSortArrow(DataGridViewCellPaintingEventArgs e, bool isColHeader)
+    {
+        if (!isColHeader || _sortDir == 0 || e.ColumnIndex != _sortCol) { return; }
         var arrow = _sortDir > 0 ? "\u25B2" : "\u25BC"; // ▲ / ▼
         var rect = new System.Drawing.Rectangle(e.CellBounds.Right - 18, e.CellBounds.Top, 15, e.CellBounds.Height);
         using var arrowFont = new Font(_grid.Font.FontFamily, 7.5f, FontStyle.Regular);
         TextRenderer.DrawText(e.Graphics, arrow, arrowFont, rect,
             System.Drawing.Color.FromArgb(70, 70, 70),
             TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
-
-        e.Handled = true;
     }
 
     private int CorrespondingNewCol(int origCol)

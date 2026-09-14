@@ -8,9 +8,11 @@ namespace EA.EplAddIn.TextBatchEdit;
 /// <summary>
 /// 轻量文件日志：DEBUG / INFO / WARN / ERROR 四级，按天一个文件。
 /// 目录优先级：
-/// 1) 脚本主数据目录下的 .log：$(MD_SCRIPTS)\.log（与 EPL-Scripts 日志位置约定一致，便于统一查看）
-/// 2) DLL 所在目录下 logs\
-/// 3) %TEMP%\EA.EplAddIn.TextBatchEdit\logs
+/// 1) 系统消息文件路径（工作站设置 STATION.SYSTEMERROR.LOGFILEPATH）下：
+///    &lt;系统消息路径&gt;\EA.EplAddIn\$(EPLAN_VERSION)\TextBatchEdit\
+/// 2) $(MD_SCRIPTS)\.log（与 EPL-Scripts 日志位置约定一致）
+/// 3) DLL 所在目录下 logs\
+/// 4) %TEMP%\EA.EplAddIn.TextBatchEdit\logs
 /// </summary>
 public static class AddInLogger
 {
@@ -28,7 +30,27 @@ public static class AddInLogger
 
     private static string ResolveLogDirectory()
     {
-        // 1) $(MD_SCRIPTS)\.log —— 脚本主数据目录（用户在此放置 .log 目录/junction）
+        // 1) 工作站设置的“系统消息文件路径” \ EA.EplAddIn \ 版本 \ TextBatchEdit
+        try
+        {
+            string? baseDir = null;
+            using (var settings = new Settings())
+            {
+                if (settings.ExistSetting("STATION.SYSTEMERROR.LOGFILEPATH"))
+                {
+                    baseDir = settings.GetStringSetting("STATION.SYSTEMERROR.LOGFILEPATH", 0);
+                }
+            }
+            var version = PathMap.SubstitutePath("$(EPLAN_VERSION)"); // 如 2.9.4
+            if (!string.IsNullOrWhiteSpace(baseDir) && !string.IsNullOrWhiteSpace(version))
+            {
+                var preferred = Path.Combine(baseDir!, "EA.EplAddIn", version!, "TextBatchEdit");
+                if (TryWritable(preferred)) { return preferred; }
+            }
+        }
+        catch { /* 设置/PathMap 早期可能不可用，走回退 */ }
+
+        // 2) $(MD_SCRIPTS)\.log —— 脚本主数据目录（用户在此放置 .log 目录/junction）
         try
         {
             var mdScripts = PathMap.SubstitutePath("$(MD_SCRIPTS)");
@@ -40,7 +62,7 @@ public static class AddInLogger
         }
         catch { /* PathMap 早期可能不可用，走回退 */ }
 
-        // 2) DLL 所在目录 logs\
+        // 3) DLL 所在目录 logs\
         try
         {
             var dllDir = Path.Combine(
@@ -50,7 +72,7 @@ public static class AddInLogger
         }
         catch { /* 走回退 */ }
 
-        // 3) 临时目录
+        // 4) 临时目录
         var fallback = Path.Combine(Path.GetTempPath(), "EA.EplAddIn.TextBatchEdit", "logs");
         Directory.CreateDirectory(fallback);
         return fallback;
