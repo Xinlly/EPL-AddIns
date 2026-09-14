@@ -51,11 +51,12 @@ public class TextBatchEditForm : Form
     private Timer? _autoSaveTimer;
     private bool _saving; // 抑制保存/刷新过程中自动保存的重入
 
-    // 任意单元格下边缘拖拽行高的状态
-    private int _dragRow = -1;
-    private int _dragStartY;
-    private int _dragStartHeight;
-    private const int ResizeEdge = 5; // 距单元格下边缘多少像素视为拖行高热区
+    // 复选框选中提示（独立 ToolTip，显示 3 秒自动消失）
+    private readonly ToolTip _checkHint = new() { InitialDelay = 0, ReshowDelay = 0, AutomaticDelay = 0, UseFading = true };
+    private readonly Timer _checkHintTimer = new() { Interval = 3000 };
+    private int _lastHintRow = -1;
+    private int _lastHintCol = -1;
+
 
     // 双击列标题三级排序：默认(结构→X↑→Y↓) → 升 → 降 → 默认
     private int _sortCol = -1;
@@ -257,7 +258,7 @@ public class TextBatchEditForm : Form
             RowHeadersVisible = true,   // 最左行首列：显示行号，兼作行选择/拖拽行高
             // 强制按最宽行号内容自适应列宽；该模式下行首宽度恒由内容决定，用户拖拽会被自动值覆盖（即禁止手动调宽）
             RowHeadersWidthSizeMode = DataGridViewRowHeadersWidthSizeMode.AutoSizeToAllHeaders,
-            AllowUserToResizeRows = true,
+            AllowUserToResizeRows = true,    // 内置行高拖拽分隔条只出现在行号（行首）列底边，数据列不可拖
             BackgroundColor = System.Drawing.Color.White,
             ClipboardCopyMode = DataGridViewClipboardCopyMode.EnableWithoutHeaderText,
             // 不用自动换行/自动行高：换行以 ¶ 单字符单行显示（与 EPLAN 原生表编辑一致），行高保留手动调整
@@ -360,19 +361,13 @@ public class TextBatchEditForm : Form
         menu.Items.Add("换行(&L)", null, (_, _) => InsertLineBreakIntoCurrent()); // 快捷键不可用时的兜底入口
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("调整列宽(&A)", null, (_, _) => AutoFitColumns());
+        menu.Items.Add("调整行高(&H)", null, (_, _) => ResetRowHeights());
         _grid.ContextMenuStrip = menu;
 
         _grid.KeyDown += GridOnKeyDown;
         _grid.ColumnHeaderMouseDoubleClick += GridOnHeaderDoubleClick; // 双击表头：顺序/倒序/默认
         _grid.CellMouseDown += GridOnCellMouseDown;
-        // 悬浮在可编辑复选框格上提示“双击修改”（复选框列恒 ReadOnly，靠 IsNewCheckCol 识别可写）
-        _grid.CellToolTipTextNeeded += (_, e) =>
-        {
-            if (e.RowIndex >= 0 && e.ColumnIndex >= 0 && IsNewCheckCol(e.ColumnIndex))
-            {
-                e.ToolTipText = "双击修改";
-            }
-        };
+        // 复选框为只读防误触，内置 cell tooltip 在该宿主下不稳定；改为“选中该格时”由独立 ToolTip 提示 3 秒（见 ShowCheckBoxHint）。
         // 双击：可写复选框格翻转勾选（列恒 ReadOnly，单击/空格均不翻转）；文本格直接进入编辑
         _grid.CellDoubleClick += (_, e) =>
         {
@@ -396,13 +391,18 @@ public class TextBatchEditForm : Form
         };
         _grid.IsGridEditing = IsEditing;
         _grid.CellFormatting += GridOnCellFormatting; // 统一单元格状态着色
-        _grid.CurrentCellChanged += (_, _) => { if (_focusCellChk is { Checked: true }) { _grid.Invalidate(); } };
+        _grid.CurrentCellChanged += (_, _) =>
+        {
+            if (_focusCellChk is { Checked: true }) { _grid.Invalidate(); }
+            ShowCheckBoxHint();
+        };
+        _checkHintTimer.Tick += (_, _) =>
+        {
+            _checkHintTimer.Stop();
+            _checkHint.Hide(_grid);
+        };
         _grid.CellPainting += GridOnCellPainting;     // 自绘列头排序箭头
-        // 任意单元格下边缘拖拽调行高
-        _grid.MouseDown += GridOnMouseDownForRowResize;
-        _grid.MouseMove += GridOnMouseMoveForRowResize;
-        _grid.MouseUp += GridOnMouseUpForRowResize;
-        _grid.MouseLeave += (_, _) => { if (_dragRow < 0) { _grid.Cursor = Cursors.Default; } };
+        // 行高拖拽交给 DataGridView 内置：分隔条只在行号（行首）列底边，数据列不响应
         // 正在编辑最后一格（焦点未离开、CellValueChanged 未触发）时，一旦有输入即乐观点亮应用；
         // 是否真有改动仍以保存前 EndEdit 后的精确脏检查为准，避免要点两次。
         _grid.EditingControlShowing += (_, e) =>
@@ -596,7 +596,7 @@ public class TextBatchEditForm : Form
                 "  • 可像 Excel 一样框选后复制、剪切、粘贴、删除（快捷键 Ctrl+C/X/V、Delete，或右键菜单）。\n" +
                 "  • 粘贴同 Excel：只选中一个格时，从该格起直接铺下整块内容；选中多格时在选区内按行列整除重复，\n" +
                 "    不能整除会提示不匹配。\n" +
-                "  • 复选框需双击才切换（单击只选中，悬停提示“双击修改”）；复制为 TRUE/FALSE，粘贴时 TRUE/1/是/√等识别为勾选。\n" +
+                "  • 复选框需双击才切换（单击只选中，选中时提示“双击修改”3 秒）；复制为 TRUE/FALSE，粘贴时 TRUE/1/是/√等识别为勾选。\n" +
                 "  • 关闭某行“多语言”时，非源语言译文会暂存并清空；重新开启时自动写回，避免切换丢值。\n" +
                 "  • 右键“还原选中的行/还原当前值”可恢复到打开窗口时的原值（即使已保存也可还原，再保存即写回）。\n\n" +
                 "【窗口用法】\n" +
@@ -667,6 +667,29 @@ public class TextBatchEditForm : Form
         _grid.Columns[_newTextCol].Visible = showSrc;
 
         AutoFitColumns();
+    }
+
+    /// <summary>
+    /// 右键“调整行高”：把行高重置为默认（新建行模板）高度。选中了数据行就只重置这些行，否则全部重置。
+    /// 内容以 ¶ 单行显示（不换行），默认高即内容所需高，相当于一键归位手动拖拽过的行高。
+    /// </summary>
+    private void ResetRowHeights()
+    {
+        var h = _grid.RowTemplate.Height;
+        if (h <= 0) { h = 28; }
+        var selectedRows = _grid.SelectedCells.Cast<DataGridViewCell>()
+            .Where(c => c.RowIndex >= 0)
+            .Select(c => c.RowIndex)
+            .Distinct()
+            .ToList();
+        if (selectedRows.Count > 0)
+        {
+            foreach (var r in selectedRows) { _grid.Rows[r].Height = h; }
+        }
+        else
+        {
+            foreach (DataGridViewRow row in _grid.Rows) { row.Height = h; }
+        }
     }
 
     /// <summary>
@@ -915,48 +938,6 @@ public class TextBatchEditForm : Form
         NoAuto = s.NoAuto,
         V = new Dictionary<ISOCode.Language, string>(s.V),
     };
-
-    // —— 任意列下边缘拖拽调整行高 ——
-    private void GridOnMouseDownForRowResize(object? sender, MouseEventArgs e)
-    {
-        if (e.Button != MouseButtons.Left || _grid.IsCurrentCellInEditMode) { return; }
-        var hit = _grid.HitTest(e.X, e.Y);
-        if (hit.Type != DataGridViewHitTestType.Cell || hit.RowIndex < 0) { return; }
-        var rect = _grid.GetCellDisplayRectangle(hit.ColumnIndex, hit.RowIndex, false);
-        if (Math.Abs(e.Y - rect.Bottom) <= ResizeEdge)
-        {
-            _dragRow = hit.RowIndex;
-            _dragStartY = e.Y;
-            _dragStartHeight = _grid.Rows[hit.RowIndex].Height;
-            _grid.Cursor = Cursors.SizeNS;
-        }
-    }
-
-    private void GridOnMouseMoveForRowResize(object? sender, MouseEventArgs e)
-    {
-        if (_dragRow >= 0)
-        {
-            var h = Math.Max(18, _dragStartHeight + (e.Y - _dragStartY));
-            _grid.Rows[_dragRow].Height = h;
-            return;
-        }
-        if (_grid.IsCurrentCellInEditMode) { return; }
-        var hit = _grid.HitTest(e.X, e.Y);
-        if (hit.Type == DataGridViewHitTestType.Cell && hit.RowIndex >= 0)
-        {
-            var rect = _grid.GetCellDisplayRectangle(hit.ColumnIndex, hit.RowIndex, false);
-            _grid.Cursor = Math.Abs(e.Y - rect.Bottom) <= ResizeEdge ? Cursors.SizeNS : Cursors.Default;
-        }
-        else if (hit.Type != DataGridViewHitTestType.ColumnHeader)
-        {
-            _grid.Cursor = Cursors.Default; // 列标题边缘交给 DataGridView 自己的列宽光标
-        }
-    }
-
-    private void GridOnMouseUpForRowResize(object? sender, MouseEventArgs e)
-    {
-        if (_dragRow >= 0) { _dragRow = -1; _grid.Cursor = Cursors.Default; }
-    }
 
     private void BuildBottomBar()
     {
@@ -1629,6 +1610,31 @@ public class TextBatchEditForm : Form
 
     /// <summary>可编辑复选框列：新值侧“多语言 / 不自动翻译”。</summary>
     private bool IsNewCheckCol(int col) => col == ColMultilang || col == ColNoAutoTrans;
+
+    /// <summary>当前格为可写复选框列时，在其上方弹出“双击修改”，3 秒后自动消失；其他格立即收起。</summary>
+    private void ShowCheckBoxHint()
+    {
+        var cur = _grid.CurrentCell;
+        if (cur == null || cur.RowIndex < 0 || !IsNewCheckCol(cur.ColumnIndex))
+        {
+            _checkHintTimer.Stop();
+            _checkHint.Hide(_grid);
+            _lastHintRow = -1;
+            _lastHintCol = -1;
+            return;
+        }
+        if (_lastHintRow == cur.RowIndex && _lastHintCol == cur.ColumnIndex) { return; }
+        _lastHintRow = cur.RowIndex;
+        _lastHintCol = cur.ColumnIndex;
+
+        var rect = _grid.GetCellDisplayRectangle(cur.ColumnIndex, cur.RowIndex, false);
+        var x = rect.Left + 4;
+        var y = rect.Top - 24; // 显示在格子上方，不遮挡勾选框
+        if (y < 0) { y = rect.Bottom - 26; } // 首行上方空间不足时落在格内底部
+        _checkHint.Show("双击修改", _grid, x, y);
+        _checkHintTimer.Stop();
+        _checkHintTimer.Start();
+    }
 
     /// <summary>双击翻转一个可编辑复选框格；赋值后既有 CellValueChanged 会联动可编辑性/自动保存。</summary>
     private void ToggleCheckBoxCell(int row, int col)
