@@ -17,7 +17,7 @@ public class TextBatchEditAction : IEplAction
     public const string ActionName = "TextBatchEditAction";
 
     /// <summary>当前已非模态打开的编辑窗（单例）；关闭后置 null。</summary>
-    private static Form? _openForm;
+    private static TextBatchEditForm? _openForm;
 
     /// <summary>把 EPLAN 主窗口句柄包装成 WinForms 属主，使浮动窗始终在主窗之上并随其最小化。</summary>
     private static IWin32Window? GetMainWindowOwner()
@@ -93,11 +93,12 @@ public class TextBatchEditAction : IEplAction
 
             AddInLogger.Info("项目源语言=" + sourceLang + "，项目语言=[" + string.Join(",", orderedLangs) + "]");
 
-            // 非模态常驻：像导航器一样可一直打开、浮动、不阻塞图形编辑器；属主设为 EPLAN 主窗，
-            // 使其始终浮在主窗之上并随主窗最小化。重复触发动作时复用已打开的窗口而不是再开一个。
+            // 非模态常驻：重复触发动作时，用最新选择集刷新已打开窗口的行（有未保存修改会弹窗询问）；
+            // 选择集未变化则只把窗口前置。首次触发则新建窗口。
             if (_openForm != null && !_openForm.IsDisposed)
             {
                 if (_openForm.WindowState == FormWindowState.Minimized) { _openForm.WindowState = FormWindowState.Normal; }
+                _openForm.ReloadSelection(texts, sourceLang, orderedLangs, project);
                 _openForm.BringToFront();
                 return true;
             }

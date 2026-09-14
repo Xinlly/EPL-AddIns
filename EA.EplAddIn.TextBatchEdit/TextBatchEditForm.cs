@@ -11,10 +11,10 @@ namespace EA.EplAddIn.TextBatchEdit;
 
 public class TextBatchEditForm : Form
 {
-    private readonly List<TextBase> _texts;
-    private readonly ISOCode.Language _sourceLang;
-    private readonly List<ISOCode.Language> _projectLangs; // 固定顺序，首位为源语言
-    private readonly Project? _project;
+    private List<TextBase> _texts;
+    private ISOCode.Language _sourceLang;
+    private List<ISOCode.Language> _projectLangs; // 固定顺序，首位为源语言
+    private Project? _project;
 
     // 每组都有“一个文本/单语言列 + N 个语言列（首位是源语言）”。
     // 文本列与源语言列始终同值、双向同步（未翻译文本的值即落在这对列上）。
@@ -36,10 +36,14 @@ public class TextBatchEditForm : Form
     private DataGridView _grid = null!;
     private CheckBox _showOrigChk = null!;
     private CheckBox _showSrcChk = null!;
+    private CheckBox _autoSaveChk = null!;
+    private Label _statusLabel = null!;
     private Button _okBtn = null!;
     private Button _cancelBtn = null!;
     private Button _applyBtn = null!;
     private CtrlEnterFilter? _keyFilter;
+    private Timer? _autoSaveTimer;
+    private bool _saving; // 抑制保存/刷新过程中自动保存的重入
 
     // 任意单元格下边缘拖拽行高的状态
     private int _dragRow = -1;
@@ -145,6 +149,7 @@ public class TextBatchEditForm : Form
 
     protected override void OnFormClosed(FormClosedEventArgs e)
     {
+        DisposeAutoSaveTimer();
         if (_keyFilter != null) { Application.RemoveMessageFilter(_keyFilter); _keyFilter = null; }
         base.OnFormClosed(e);
     }
@@ -220,77 +225,7 @@ public class TextBatchEditForm : Form
             },
         };
 
-        _grid.Columns.Add("idx", "#");
-        _grid.Columns[ColIndex].Width = 42;
-        _grid.Columns[ColIndex].ReadOnly = true;
-        _grid.Columns[ColIndex].SortMode = DataGridViewColumnSortMode.NotSortable;
-
-        _grid.Columns.Add("type", "对象类型");
-        _grid.Columns[ColType].Width = 100;
-        _grid.Columns[ColType].ReadOnly = true;
-        _grid.Columns[ColType].SortMode = DataGridViewColumnSortMode.NotSortable;
-
-        // —— 只读结构/坐标信息列（类型右侧）——
-        AddInfoColumn("plant", "高层代号\n=", ColPlant, 90);
-        AddInfoColumn("place", "安装地点\n++", ColPlace, 90);
-        AddInfoColumn("location", "位置代号\n+", ColLocation, 90);
-        AddInfoColumn("x", "X 坐标", ColX, 80);
-        AddInfoColumn("y", "Y 坐标", ColY, 80);
-
-        // —— 原值侧（只读，默认随“显示原值”整体隐藏）——
-        _grid.Columns.Add(new DataGridViewCheckBoxColumn { Name = "orig_multilang", HeaderText = "原值\n多语言", Width = 70, ReadOnly = true, Visible = false });
-        _grid.Columns[ColOrigMultilang].SortMode = DataGridViewColumnSortMode.NotSortable;
-        _grid.Columns.Add(new DataGridViewCheckBoxColumn { Name = "orig_noAutoTrans", HeaderText = "原值\n不自动翻译", Width = 92, ReadOnly = true, Visible = false });
-        _grid.Columns[ColOrigNoAuto].SortMode = DataGridViewColumnSortMode.NotSortable;
-
-        var dnSource = LangHelper.DisplayName(_sourceLang);
-
-        // —— 原值列（只读、默认隐藏，可用“显示原值”展开）——
-        _grid.Columns.Add("orig_text", "原值 · 源语言\n" + dnSource);
-        _grid.Columns[_origTextCol].Width = 190;
-        _grid.Columns[_origTextCol].ReadOnly = true;
-        _grid.Columns[_origTextCol].Visible = false; // 默认隐藏，与其余原值列一致，由“显示原值”统一展开
-        _grid.Columns[_origTextCol].SortMode = DataGridViewColumnSortMode.NotSortable;
-
-        for (var i = 0; i < _projectLangs.Count; i++)
-        {
-            var lang = _projectLangs[i];
-            var idx = OrigLangStart + i;
-            var title = "原值\n" + LangHelper.DisplayName(lang); // 原值\n中文(中国) / 原值\n英文(美国)…
-            _grid.Columns.Add("orig_" + LangHelper.Code(lang), title);
-            _grid.Columns[idx].Width = 180;
-            _grid.Columns[idx].ReadOnly = true;
-            _grid.Columns[idx].Visible = false; // 默认隐藏，由“显示原值”统一展开
-            _grid.Columns[idx].SortMode = DataGridViewColumnSortMode.NotSortable;
-            _origLangCol[lang] = idx;
-        }
-
-        // —— 新值侧复选框（可编辑），位于原值列右边、新值文本列左边 ——
-        _grid.Columns.Add(new DataGridViewCheckBoxColumn { Name = "multilang", HeaderText = "多语言", Width = 60 });
-        _grid.Columns[ColMultilang].SortMode = DataGridViewColumnSortMode.NotSortable;
-        _grid.Columns.Add(new DataGridViewCheckBoxColumn { Name = "noAutoTrans", HeaderText = "不自动翻译", Width = 84 });
-        _grid.Columns[ColNoAutoTrans].SortMode = DataGridViewColumnSortMode.NotSortable;
-
-        // —— 新值列（可编辑）——
-        _grid.Columns.Add("new_text", "源语言\n" + dnSource);
-        _grid.Columns[_newTextCol].Width = 200;
-        _grid.Columns[_newTextCol].SortMode = DataGridViewColumnSortMode.NotSortable;
-        ((DataGridViewTextBoxColumn)_grid.Columns[_newTextCol]).CellTemplate = new LineBreakTextBoxCell();
-
-        for (var i = 0; i < _projectLangs.Count; i++)
-        {
-            var lang = _projectLangs[i];
-            var idx = NewLangStart + i;
-            // 源语言语言列与“源语言文本列”双向同步，两列标题同名
-            var title = lang == _sourceLang
-                ? "源语言\n" + dnSource
-                : LangHelper.DisplayName(lang); // 中文(中国) / 英文(美国)…
-            _grid.Columns.Add("new_" + LangHelper.Code(lang), title);
-            _grid.Columns[idx].Width = 200;
-            _grid.Columns[idx].SortMode = DataGridViewColumnSortMode.NotSortable;
-            ((DataGridViewTextBoxColumn)_grid.Columns[idx]).CellTemplate = new LineBreakTextBoxCell();
-            _newLangCol[lang] = idx;
-        }
+        BuildColumns();
 
         // 复选框即时提交
         _grid.CurrentCellDirtyStateChanged += (_, _) =>
@@ -324,6 +259,7 @@ public class TextBatchEditForm : Form
                 SyncPair(e.RowIndex, _newLangCol[_sourceLang], _newTextCol); // 源语言列 → 文本列
             }
             UpdateApplyEnabled();
+            ScheduleAutoSave();
         };
 
         // 右键菜单
@@ -364,6 +300,99 @@ public class TextBatchEditForm : Form
         };
     }
 
+    /// <summary>创建全部列。首次构建调用；同一窗口/同一项目内刷新选择集时列结构不变，仅重建行。</summary>
+    private void BuildColumns()
+    {
+        _grid.Columns.Clear();
+        _origLangCol.Clear();
+        _newLangCol.Clear();
+
+        _grid.Columns.Add("idx", "#");
+        _grid.Columns[ColIndex].Width = 46;
+        _grid.Columns[ColIndex].ReadOnly = true;
+        _grid.Columns[ColIndex].SortMode = DataGridViewColumnSortMode.NotSortable;
+
+        _grid.Columns.Add("type", "对象类型");
+        _grid.Columns[ColType].Width = 100;
+        _grid.Columns[ColType].ReadOnly = true;
+        _grid.Columns[ColType].SortMode = DataGridViewColumnSortMode.NotSortable;
+
+        // —— 只读结构/坐标信息列（类型右侧）——
+        AddInfoColumn("plant", "高层代号\n=", ColPlant, 90);
+        AddInfoColumn("place", "安装地点\n++", ColPlace, 90);
+        AddInfoColumn("location", "位置代号\n+", ColLocation, 90);
+        AddInfoColumn("x", "X 坐标", ColX, 80);
+        AddInfoColumn("y", "Y 坐标", ColY, 80);
+
+        // —— 原值侧（只读，默认随“显示原值”整体隐藏）——
+        _grid.Columns.Add(new DataGridViewCheckBoxColumn { Name = "orig_multilang", HeaderText = "原值\n多语言", Width = 70, ReadOnly = true, Visible = false });
+        _grid.Columns[ColOrigMultilang].SortMode = DataGridViewColumnSortMode.NotSortable;
+        _grid.Columns.Add(new DataGridViewCheckBoxColumn { Name = "orig_noAutoTrans", HeaderText = "原值\n不自动翻译", Width = 92, ReadOnly = true, Visible = false });
+        _grid.Columns[ColOrigNoAuto].SortMode = DataGridViewColumnSortMode.NotSortable;
+
+        var dnSource = LangHelper.DisplayName(_sourceLang);
+
+        // —— 原值列（只读、默认隐藏，可用“显示原值”展开）——
+        _grid.Columns.Add("orig_text", "原值 · 源语言\n" + dnSource);
+        _grid.Columns[_origTextCol].Width = 190;
+        _grid.Columns[_origTextCol].ReadOnly = true;
+        _grid.Columns[_origTextCol].Visible = false;
+        _grid.Columns[_origTextCol].SortMode = DataGridViewColumnSortMode.NotSortable;
+
+        for (var i = 0; i < _projectLangs.Count; i++)
+        {
+            var lang = _projectLangs[i];
+            var idx = OrigLangStart + i;
+            var title = "原值\n" + LangHelper.DisplayName(lang);
+            _grid.Columns.Add("orig_" + LangHelper.Code(lang), title);
+            _grid.Columns[idx].Width = 180;
+            _grid.Columns[idx].ReadOnly = true;
+            _grid.Columns[idx].Visible = false;
+            _grid.Columns[idx].SortMode = DataGridViewColumnSortMode.NotSortable;
+            _origLangCol[lang] = idx;
+        }
+
+        // —— 新值侧复选框（可编辑）——
+        _grid.Columns.Add(new DataGridViewCheckBoxColumn { Name = "multilang", HeaderText = "多语言", Width = 60 });
+        _grid.Columns[ColMultilang].SortMode = DataGridViewColumnSortMode.NotSortable;
+        _grid.Columns.Add(new DataGridViewCheckBoxColumn { Name = "noAutoTrans", HeaderText = "不自动翻译", Width = 84 });
+        _grid.Columns[ColNoAutoTrans].SortMode = DataGridViewColumnSortMode.NotSortable;
+
+        // —— 新值列（可编辑）——
+        _grid.Columns.Add("new_text", "源语言\n" + dnSource);
+        _grid.Columns[_newTextCol].Width = 200;
+        _grid.Columns[_newTextCol].SortMode = DataGridViewColumnSortMode.NotSortable;
+        ((DataGridViewTextBoxColumn)_grid.Columns[_newTextCol]).CellTemplate = new LineBreakTextBoxCell();
+
+        for (var i = 0; i < _projectLangs.Count; i++)
+        {
+            var lang = _projectLangs[i];
+            var idx = NewLangStart + i;
+            var title = lang == _sourceLang ? "源语言\n" + dnSource : LangHelper.DisplayName(lang);
+            _grid.Columns.Add("new_" + LangHelper.Code(lang), title);
+            _grid.Columns[idx].Width = 200;
+            _grid.Columns[idx].SortMode = DataGridViewColumnSortMode.NotSortable;
+            ((DataGridViewTextBoxColumn)_grid.Columns[idx]).CellTemplate = new LineBreakTextBoxCell();
+            _newLangCol[lang] = idx;
+        }
+    }
+
+    /// <summary>统一生成顶部开关：同高、同垂直边距、同基线，便于横向对齐与后续扩展。</summary>
+    private static CheckBox MakeToggle(string text, int width, bool isChecked)
+    {
+        return new CheckBox
+        {
+            Text = text,
+            Width = width,
+            Height = 28,
+            Checked = isChecked,
+            AutoSize = false,
+            TextAlign = ContentAlignment.MiddleLeft,
+            CheckAlign = ContentAlignment.MiddleLeft,
+            Margin = new Padding(0, 3, 0, 0),
+        };
+    }
+
     /// <summary>把源列当前值同步到配对列（两列承载同一份源语言/单语言文本）。</summary>
     private void SyncPair(int row, int fromCol, int toCol)
     {
@@ -379,36 +408,28 @@ public class TextBatchEditForm : Form
         // 标签页 1：编辑（顶部开关 + 表格）
         var tabEdit = new TabPage("编辑");
 
-        var bar = new Panel { Dock = DockStyle.Top, Height = 30 };
+        var bar = new Panel { Dock = DockStyle.Top, Height = 34 };
         var barFlow = new FlowLayoutPanel
         {
             Dock = DockStyle.Fill,
             FlowDirection = FlowDirection.LeftToRight,
             WrapContents = false,
-            Padding = new Padding(8, 5, 0, 0),
+            Padding = new Padding(10, 0, 0, 0),
         };
 
-        _showOrigChk = new CheckBox
-        {
-            Text = "显示原值",
-            Width = 100,
-            Checked = false,
-            TextAlign = ContentAlignment.MiddleLeft,
-        };
+        // 所有开关统一经 MakeToggle 创建：同高、同垂直边距、同基线，保证 y 对齐；新增开关只需一行。
+        _showOrigChk = MakeToggle("显示原值", 96, false);
         _showOrigChk.CheckedChanged += (_, _) => UpdateColumnVisibility();
 
-        _showSrcChk = new CheckBox
-        {
-            Text = "显示源语言",
-            Width = 110,
-            Checked = false, // 默认不显示源语言列（原值侧与新值侧同源列一起隐藏）
-            TextAlign = ContentAlignment.MiddleLeft,
-            Margin = new Padding(12, 0, 0, 0),
-        };
+        _showSrcChk = MakeToggle("显示源语言", 108, false); // 默认不显示源语言列
         _showSrcChk.CheckedChanged += (_, _) => UpdateColumnVisibility();
+
+        _autoSaveChk = MakeToggle("自动保存", 96, true);     // 默认开启：编辑结束即写回
+        _autoSaveChk.CheckedChanged += (_, _) => OnAutoSaveToggled();
 
         barFlow.Controls.Add(_showOrigChk);
         barFlow.Controls.Add(_showSrcChk);
+        barFlow.Controls.Add(_autoSaveChk);
         bar.Controls.Add(barFlow);
 
         tabEdit.Controls.Add(_grid); // 先加：Fill 占满
@@ -424,17 +445,21 @@ public class TextBatchEditForm : Form
             Font = new Font(SystemFonts.MessageBoxFont.FontFamily, 9.5f),
             Text =
                 "【怎么用】\n" +
-                "  • 直接双击格子修改文字；改完点“应用”保存，或点“确定”保存并关闭。\n" +
-                "  • 想放弃本次修改点“取消”；“应用”后窗口不关闭，可继续修改。\n\n" +
+                "  • 直接双击格子修改文字；默认“自动保存”开启，停顿约半秒即自动写回（一个撤销点）。\n" +
+                "  • 关闭“自动保存”后，用“应用”保存、“确定”保存并关闭、“取消”放弃。\n\n" +
                 "【两个勾选框】\n" +
                 "  • 多语言：勾选后可填写中文、英文等各语言内容；不勾选则只填一份内容。\n" +
                 "  • 不自动翻译：勾选后该文本不参与自动翻译。\n\n" +
-                "【上方两个开关】\n" +
+                "【上方开关】\n" +
                 "  • 显示原值：在左侧展开灰色的“原…”列，方便对照修改前的内容。\n" +
-                "  • 显示源语言：显示/隐藏源语言那一列（原值侧与新值侧各一列）；默认不显示。\n\n" +
+                "  • 显示源语言：显示/隐藏源语言那一列（原值侧与新值侧各一列）；默认不显示。\n" +
+                "  • 自动保存：开启后编辑停顿即自动写回；关闭后需手动“应用”。默认开启。\n\n" +
+                "【换选中文本】\n" +
+                "  • 窗口常开时，重新在图纸上框选文本再执行命令，表格会刷新为新选择；\n" +
+                "    若有未保存修改会先弹窗（保存并刷新/放弃刷新/取消）。\n\n" +
                 "【结构/坐标只读列】\n" +
-                "  • 类型右侧为只读信息：高层代号(=)、安装地点(++)、位置代号(+)、X、Y 坐标。\n" +
-                "  • 开窗默认按“结构标识符管理”里的顺序排序，再按 X 从小到大、Y 从大到小。\n" +
+                "  • 最左列为行号；类型右侧为只读信息：高层代号(=)、安装地点(++)、位置代号(+)、X、Y。\n" +
+                "  • 结构信息取自文本所在页；默认按“结构标识符管理”里的顺序，再按 X 从小到大、Y 从大到小。\n" +
                 "  • 灰色只读列仅显示，不能修改。\n\n" +
                 "【换行与排版】\n" +
                 "  • 单元格里按 Ctrl+Enter 换行（显示为 ¶，保存后即为真正换行）；也可右键选“换行”。\n" +
@@ -758,7 +783,17 @@ public class TextBatchEditForm : Form
         btnPanel.Controls.Add(_cancelBtn);
         btnPanel.Controls.Add(_applyBtn);
 
-        layout.Controls.Add(new Panel(), 0, 0);
+        // 左侧：状态提示区（未保存数量 / 已保存 / 自动保存状态）
+        _statusLabel = new Label
+        {
+            Dock = DockStyle.Fill,
+            TextAlign = ContentAlignment.MiddleLeft,
+            Padding = new Padding(12, 0, 0, 0),
+            AutoEllipsis = true,
+            ForeColor = System.Drawing.Color.FromArgb(90, 90, 90),
+        };
+
+        layout.Controls.Add(_statusLabel, 0, 0);
         layout.Controls.Add(btnPanel, 1, 0);
         panel.Controls.Add(layout);
         Controls.Add(panel);
@@ -807,20 +842,40 @@ public class TextBatchEditForm : Form
         }
         roots.Sort((a, b) => a.SortId.CompareTo(b.SortId));
 
-        for (var i = 0; i < roots.Count; i++)
+        // 按“结构标识符管理”树做先序遍历：顶层按 SortId，进入子层后同样按 SortId，
+        // 给每个节点的完整标识符路径编号，多级结构（如 =A.A1）也能正确排序。
+        var seq = 0.0;
+        foreach (var root in roots)
         {
-            var key = NormIdent(roots[i].Name);
-            if (key.Length > 0 && !map.ContainsKey(key)) { map[key] = i; }
+            seq = WalkLocationDfs(root, map, ref seq);
         }
+        AddInLogger.Debug("结构顺序(" + h + ") 节点数=" + map.Count);
     }
 
-    /// <summary>归一化结构标识符用于排序匹配：去前缀符号/空白，大写（名称本身一般不含 =/+ 前缀）。</summary>
+    private static double WalkLocationDfs(Location node, Dictionary<string, double> map, ref double seq)
+    {
+        var key = NormIdent(node.Name);
+        if (key.Length > 0 && !map.ContainsKey(key)) { map[key] = seq; seq += 1; }
+
+        Location[]? children = null;
+        try { children = node.SubNodes; }
+        catch (Exception ex) { AddInLogger.Debug("SubNodes 失败(" + node.Name + ")：" + ex.Message); }
+        if (children != null && children.Length > 0)
+        {
+            var kids = children.ToList();
+            kids.Sort((a, b) => a.SortId.CompareTo(b.SortId));
+            foreach (var child in kids) { seq = WalkLocationDfs(child, map, ref seq); }
+        }
+        return seq;
+    }
+
+    /// <summary>归一化结构标识符用于排序匹配：去前缀符号/空白/点间空格，大写。兼容 "=A.A1" / "A.A1"。</summary>
     private static string NormIdent(string? s)
     {
         if (string.IsNullOrEmpty(s)) { return string.Empty; }
         var t = s!.Trim();
-        while (t.Length > 0 && (t[0] == '=' || t[0] == '+' || t[0] == '&' || t[0] == '#')) { t = t.Substring(1).Trim(); }
-        return t.ToUpperInvariant();
+        while (t.Length > 0 && (t[0] == '=' || t[0] == '+' || t[0] == '&' || t[0] == '#' || t[0] == '@')) { t = t.Substring(1).Trim(); }
+        return t.Replace(" ", string.Empty).ToUpperInvariant();
     }
 
     private double RankOf(Dictionary<string, double> map, string ident)
@@ -828,7 +883,7 @@ public class TextBatchEditForm : Form
         return map.TryGetValue(NormIdent(ident), out var r) ? r : double.MaxValue;
     }
 
-    /// <summary>读取一个文本对象所属页的三段主结构标识符与图形坐标，组装只读信息（并填好排序 rank）。</summary>
+    /// <summary>读取一个文本对象所属页的三段完整结构标识符与图形坐标，组装只读信息（并填好排序 rank）。</summary>
     private RowMeta BuildMeta(TextBase t)
     {
         var m = new RowMeta();
@@ -838,9 +893,12 @@ public class TextBatchEditForm : Form
             if (page != null)
             {
                 var pp = page.Properties;
-                m.Plant = PageIdent(pp.DESIGNATION_PLANT);
-                m.Place = PageIdent(pp.DESIGNATION_PLACEOFINSTALLATION);
-                m.Location = PageIdent(pp.DESIGNATION_LOCATION);
+                // 用“完整/已解析”属性：继承上级页、含子结构的实际标识；未展开段 DESIGNATION_PLANT 可能为空。
+                m.Plant = PageIdent(pp.DESIGNATION_FULLPLANT);
+                m.Place = PageIdent(pp.DESIGNATION_FULLPLACEOFINSTALLATION);
+                m.Location = PageIdent(pp.DESIGNATION_FULLLOCATION);
+                AddInLogger.Debug("页结构 页=" + page.Name
+                    + " 高层=[" + m.Plant + "] 安装=[" + m.Place + "] 位置=[" + m.Location + "]");
             }
         }
         catch (Exception ex)
@@ -872,6 +930,14 @@ public class TextBatchEditForm : Form
         return s == null ? string.Empty : s.Trim();
     }
 
+    /// <summary>项目稳定标识（链接完整路径）；取不到时退化为 null。用于判断是否同一项目。</summary>
+    private static string SafeProjectKey(Project? p)
+    {
+        if (p == null) { return string.Empty; }
+        try { return p.ProjectFullName ?? string.Empty; }
+        catch { return string.Empty; }
+    }
+
     /// <summary>坐标（mm）显示：整数不带小数点，最多 3 位小数。</summary>
     private static string FormatCoord(double v) => v.ToString("0.###");
 
@@ -881,6 +947,60 @@ public class TextBatchEditForm : Form
         _sortCol = -1;
         _sortDir = 0;
         ApplySort(ColIndex, 0);
+    }
+
+    /// <summary>
+    /// 窗口已常驻时，用最新选择集刷新表格行。选择集未变化则什么都不做；
+    /// 存在未保存修改时弹窗询问（保存并刷新/丢弃刷新/取消）。语言集合或项目变化时连列一起重建。
+    /// 返回 true 表示已刷新，false 表示用户取消或选择未变化。
+    /// </summary>
+    public bool ReloadSelection(List<TextBase> texts, ISOCode.Language sourceLang,
+        List<ISOCode.Language> projectLangs, Project? project)
+    {
+        if (texts.Count == 0) { return false; }
+
+        // 选择集是否与当前相同：同一项目（按项目链接完整路径）+ 同样的对象 DBID 顺序
+        var newProjectKey = SafeProjectKey(project);
+        var oldProjectKey = SafeProjectKey(_project);
+        var sameProject = string.Equals(newProjectKey, oldProjectKey, StringComparison.OrdinalIgnoreCase);
+        var sameTexts = sameProject
+            && texts.Count == _texts.Count
+            && texts.Select(tx => tx.DatabaseIdentifier)
+                    .SequenceEqual(_texts.Select(tx => tx.DatabaseIdentifier));
+        if (sameTexts) { return false; }
+
+        // 有未保存修改：先问怎么办
+        if (_grid.IsCurrentCellInEditMode) { _grid.EndEdit(); }
+        var dirtyCount = DirtyRows().Count;
+        if (dirtyCount > 0)
+        {
+            var ans = MessageBox.Show(
+                "当前有 " + dirtyCount + " 处修改尚未保存。\n\n" +
+                "“是”保存这些修改后用新选择刷新；\n“否”放弃未保存修改并刷新；\n“取消”保持现状。",
+                "文本批量编辑", MessageBoxButtons.YesNoCancel, MessageBoxIcon.Question);
+            if (ans == DialogResult.Cancel) { return false; }
+            if (ans == DialogResult.Yes && !SaveDirty(quietSuccess: true)) { return false; } // 保存失败（如回读不一致）则中止
+        }
+
+        // 项目或语言集合变化 → 连列结构一起重建；否则只重建行
+        var langChanged = projectLangs.Count != _projectLangs.Count || projectLangs.Except(_projectLangs).Any();
+        _texts = texts;
+        _project = project;
+        _sourceLang = sourceLang;
+        _projectLangs = projectLangs;
+        Text = "文本批量编辑（源语言：" + LangHelper.Code(sourceLang) + "，共 " + texts.Count + " 个文本）";
+
+        DisposeAutoSaveTimer();
+        if (langChanged)
+        {
+            BuildColumns();
+        }
+        LoadRows();
+        ApplyDefaultOrder();
+        UpdateColumnVisibility();
+        UpdateApplyEnabled();
+        AddInLogger.Info("ReloadSelection: 已用新选择集刷新 count=" + texts.Count);
+        return true;
     }
 
     private void LoadRows()
@@ -1068,8 +1188,8 @@ public class TextBatchEditForm : Form
             IOrderedEnumerable<SortView> primary;
             if (col == ColIndex)
             {
-                double Num(SortView v) => double.TryParse(v.Values[col] as string, out var x) ? x : 0;
-                primary = dir > 0 ? views.OrderBy(Num) : views.OrderByDescending(Num);
+                // # 列始终是当前显示行号；双击它改为按“开窗原始序号”排序
+                primary = dir > 0 ? views.OrderBy(v => v.Orig) : views.OrderByDescending(v => v.Orig);
             }
             else if (col == ColX)
             {
@@ -1114,13 +1234,16 @@ public class TextBatchEditForm : Form
         try
         {
             _grid.Rows.Clear();
+            var ri = 0;
             foreach (var v in sorted)
             {
-                var ri = _grid.Rows.Add();
-                var row = _grid.Rows[ri];
+                var row = _grid.Rows[_grid.Rows.Add()];
                 for (var c = 0; c < colCount; c++) { row.Cells[c].Value = v.Values[c]; }
+                // 行号列始终显示当前显示位置 1..n（开窗原始序号保存在 Orig，供双击 # 排序）
+                row.Cells[ColIndex].Value = (ri + 1).ToString();
                 row.Height = v.Height;
                 SetRowEditable(ri, Convert.ToBoolean(v.Values[ColMultilang] ?? false));
+                ri++;
             }
         }
         finally
@@ -1186,13 +1309,75 @@ public class TextBatchEditForm : Form
 
     private void UpdateApplyEnabled()
     {
-        if (_applyBtn != null) { _applyBtn.Enabled = DirtyRows().Count > 0; }
+        var dirty = DirtyRows().Count;
+        if (_applyBtn != null) { _applyBtn.Enabled = dirty > 0; }
+        UpdateStatus(dirty);
         if (_grid != null) { _grid.Invalidate(); } // 触发 CellFormatting 重算脏/已保存底色
+    }
+
+    /// <summary>底部左侧状态提示：未保存数量 / 全部已保存 / 自动保存状态。</summary>
+    private void UpdateStatus(int dirtyCount)
+    {
+        if (_statusLabel == null) { return; }
+        var auto = _autoSaveChk != null && _autoSaveChk.Checked;
+        if (dirtyCount > 0)
+        {
+            _statusLabel.Text = "● " + dirtyCount + " 处未保存" + (auto ? "（将自动保存）" : string.Empty);
+            _statusLabel.ForeColor = System.Drawing.Color.FromArgb(190, 90, 0); // 醒目橙
+        }
+        else
+        {
+            _statusLabel.Text = auto ? "自动保存已开启 · 全部已保存" : "已全部保存";
+            _statusLabel.ForeColor = System.Drawing.Color.FromArgb(60, 130, 70); // 绿
+        }
+    }
+
+    /// <summary>开关“自动保存”：开启时把当前未保存内容安排一次写回；始终刷新状态。</summary>
+    private void OnAutoSaveToggled()
+    {
+        var on = _autoSaveChk.Checked;
+        AddInLogger.Debug("自动保存开关=" + on);
+        if (on) { ScheduleAutoSave(); } else { DisposeAutoSaveTimer(); }
+        UpdateApplyEnabled();
+    }
+
+    private void ScheduleAutoSave()
+    {
+        if (_saving || _autoSaveChk == null || !_autoSaveChk.Checked) { return; }
+        if (IsDisposed) { return; }
+        if (_autoSaveTimer == null)
+        {
+            _autoSaveTimer = new System.Windows.Forms.Timer { Interval = 600 };
+            _autoSaveTimer.Tick += (_, _) =>
+            {
+                _autoSaveTimer.Stop();
+                if (IsDisposed || _saving || _autoSaveChk == null || !_autoSaveChk.Checked) { return; }
+                if (DirtyRows().Count == 0) { return; }
+                _saving = true;
+                try
+                {
+                    AddInLogger.Debug("自动保存触发");
+                    SaveDirty(quietSuccess: true);
+                }
+                finally
+                {
+                    _saving = false;
+                }
+            };
+        }
+        _autoSaveTimer.Stop();
+        _autoSaveTimer.Start(); // 600ms 防抖：连续编辑合并为一次写回/一个撤销点
+    }
+
+    private void DisposeAutoSaveTimer()
+    {
+        if (_autoSaveTimer != null) { _autoSaveTimer.Stop(); _autoSaveTimer.Dispose(); _autoSaveTimer = null; }
     }
 
     private void EditingTextChanged(object? sender, EventArgs e)
     {
         if (_applyBtn is { Enabled: false }) { _applyBtn.Enabled = true; }
+        ScheduleAutoSave(); // 当前格未提交也计时；SaveDirty 开头会先 EndEdit 提交
     }
 
     private void GridOnCellMouseClick(object? s, DataGridViewCellMouseEventArgs e)
