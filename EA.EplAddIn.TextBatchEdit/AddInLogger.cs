@@ -7,27 +7,32 @@ namespace EA.EplAddIn.TextBatchEdit;
 
 /// <summary>
 /// 轻量文件日志：DEBUG / INFO / WARN / ERROR 四级，按天一个文件。
-/// 目录优先级：
-/// 1) 系统消息文件路径（工作站设置 STATION.SYSTEMERROR.LOGFILEPATH）下：
-///    &lt;系统消息路径&gt;\EA.EplAddIn\$(EPLAN_VERSION)\TextBatchEdit\
-/// 2) $(MD_SCRIPTS)\.log（与 EPL-Scripts 日志位置约定一致）
-/// 3) DLL 所在目录下 logs\
-/// 4) %TEMP%\EA.EplAddIn.TextBatchEdit\logs
+/// 当前写盘目录写死为系统消息路径下的绝对目录（临时方案，便于在 2.9 平台稳定落盘）；
+/// 从工作站设置 STATION.SYSTEMERROR.LOGFILEPATH + $(EPLAN_VERSION) 动态计算的路径仅在“说明”页预览，
+/// 待动态路径实测稳定后再切换为正式写盘路径。动态路径的解析过程写入本日志文件。
 /// </summary>
 public static class AddInLogger
 {
     private const int MinLevel = 0; // 0=Debug 1=Info 2=Warn 3=Error
     private static readonly object LockObj = new object();
+
+    // —— 临时写死的绝对目录（系统消息路径 C:\Users\Public\EPLAN\Electric P8 + EA.EplAddIn\2.9.4\TextBatchEdit）——
+    private const string FixedBaseDir = @"C:\Users\Public\EPLAN\Electric P8";
+    private const string FixedVersion = "2.9.4";
+
     private static readonly string LogDirectory = ResolveLogDirectory();
+    private static string DynamicNote = "";     // 动态路径解析过程（写入日志）
+    private static string? DynamicFilePath;    // 动态路径预览（仅说明页展示，不写盘）
 
-    /// <summary>目录解析过程说明（含 STATION 设置原始值/版本/失败原因），供“说明”页诊断展示。</summary>
-    public static string ResolutionNote { get; private set; } = "";
-
+    /// <summary>当前实际写入的日志目录。</summary>
     public static string DirectoryPath => LogDirectory;
 
     /// <summary>当前实际写入的日志文件完整路径（按天文件名）。</summary>
     public static string ActiveLogFilePath =>
         Path.Combine(LogDirectory, "addin-" + DateTime.Now.ToString("yyyy-MM-dd") + ".log");
+
+    /// <summary>动态计算得到的候选日志文件路径（暂不启用，仅说明页预览）；不可用时为 null。</summary>
+    public static string? PreviewLogFilePath => DynamicFilePath;
 
     public static void Debug(string message) => Write("DEBUG", message, null);
     public static void Info(string message) => Write("INFO ", message, null);
@@ -37,57 +42,40 @@ public static class AddInLogger
 
     private static string ResolveLogDirectory()
     {
-        var note = new StringBuilder();
+        // 先算动态候选（仅预览 + 诊断），不参与写盘决策
+        DynamicFilePath = TryComputeDynamicPath(out var note);
+        DynamicNote = note;
 
-        // 1) 工作站设置的“系统消息文件路径” \ EA.EplAddIn \ 版本 \ TextBatchEdit
+        // 1) 写死的绝对目录
+        var preferred = Path.Combine(FixedBaseDir, "EA.EplAddIn", FixedVersion, "TextBatchEdit");
         try
         {
-            // 不依赖 ExistSetting（实测可能对该工作站项误判），直接读取，读不到会抛 BaseException
-            string baseDir;
-            using (var settings = new Settings())
+            if (TryWritable(preferred))
             {
-                baseDir = settings.GetStringSetting("STATION.SYSTEMERROR.LOGFILEPATH", 0);
-            }
-            var version = PathMap.SubstitutePath("$(EPLAN_VERSION)"); // 如 2.9.4
-            note.Append("STATION.SYSTEMERROR.LOGFILEPATH=[").Append(baseDir).Append("]；$(EPLAN_VERSION)=[").Append(version).Append("]。");
-            if (!string.IsNullOrWhiteSpace(baseDir) && !string.IsNullOrWhiteSpace(version))
-            {
-                var preferred = Path.Combine(baseDir!, "EA.EplAddIn", version!, "TextBatchEdit");
-                if (TryWritable(preferred))
-                {
-                    note.Append("命中并可写：").Append(preferred);
-                    ResolutionNote = note.ToString();
-                    return preferred;
-                }
-                note.Append("目标不可写：").Append(preferred).Append("，回退。");
-            }
-            else
-            {
-                note.Append("设置值或版本为空，回退。");
+                EmitStartupDiagnostic(preferred);
+                return preferred;
             }
         }
         catch (Exception ex)
         {
-            note.Append("读取工作站设置失败：").Append(ex.GetType().Name).Append(": ").Append(ex.Message).Append("，回退。");
+            DynamicNote += " 写死目录不可用：" + ex.Message + "。";
         }
 
-        // 2) $(MD_SCRIPTS)\.log —— 脚本主数据目录（用户在此放置 .log 目录/junction）
+        // 2) 回退 $(MD_SCRIPTS)\.log
         try
         {
             var mdScripts = PathMap.SubstitutePath("$(MD_SCRIPTS)");
             if (!string.IsNullOrEmpty(mdScripts))
             {
-                var preferred = Path.Combine(mdScripts, ".log");
-                if (TryWritable(preferred))
+                var alt = Path.Combine(mdScripts, ".log");
+                if (TryWritable(alt))
                 {
-                    note.Append(" 回退命中 $(MD_SCRIPTS)\\.log：").Append(preferred);
-                    ResolutionNote = note.ToString();
-                    return preferred;
+                    EmitStartupDiagnostic(alt);
+                    return alt;
                 }
-                note.Append(" $(MD_SCRIPTS)\\.log 不可写：").Append(preferred).Append("。");
             }
         }
-        catch (Exception ex) { note.Append(" $(MD_SCRIPTS) 不可用：").Append(ex.Message).Append("。"); }
+        catch { /* 走回退 */ }
 
         // 3) DLL 所在目录 logs\
         try
@@ -97,19 +85,77 @@ public static class AddInLogger
                 "logs");
             if (TryWritable(dllDir))
             {
-                note.Append(" 回退命中 DLL 旁 logs：").Append(dllDir);
-                ResolutionNote = note.ToString();
+                EmitStartupDiagnostic(dllDir);
                 return dllDir;
             }
         }
-        catch (Exception ex) { note.Append(" DLL 旁 logs 不可用：").Append(ex.Message).Append("。"); }
+        catch { /* 走回退 */ }
 
         // 4) 临时目录
         var fallback = Path.Combine(Path.GetTempPath(), "EA.EplAddIn.TextBatchEdit", "logs");
         Directory.CreateDirectory(fallback);
-        note.Append(" 最终回退临时目录：").Append(fallback);
-        ResolutionNote = note.ToString();
+        EmitStartupDiagnostic(fallback);
         return fallback;
+    }
+
+    /// <summary>
+    /// 从工作站设置 STATION.SystemError.LogFilePath + $(EPLAN_VERSION) 计算候选日志文件路径（仅预览）。
+    /// 注意：设置路径区分大小写，模块名/设置名为驼峰（SystemError/LogFilePath），全大写会报 S024001。
+    /// 不抛异常；取不到时 filePath 返回 null，note 记录原因。
+    /// </summary>
+    private static string? TryComputeDynamicPath(out string note)
+    {
+        var sb = new StringBuilder();
+        try
+        {
+            string baseDirRaw;
+            using (var settings = new Settings())
+            {
+                baseDirRaw = settings.GetStringSetting("STATION.SystemError.LogFilePath", 0);
+            }
+            // 默认设置值可能是 PathMap 变量 $(DEFAULT_LOGFILEPATH)，需再展开一次
+            var baseDir = PathMap.SubstitutePath(baseDirRaw ?? string.Empty);
+            var version = PathMap.SubstitutePath("$(EPLAN_VERSION)"); // 如 2.9.4
+            sb.Append("STATION.SystemError.LogFilePath 原始值=[").Append(baseDirRaw)
+              .Append("]，展开后=[").Append(baseDir)
+              .Append("]；$(EPLAN_VERSION)=[").Append(version).Append("]。");
+            if (!string.IsNullOrWhiteSpace(baseDir) && !string.IsNullOrWhiteSpace(version))
+            {
+                var dir = Path.Combine(baseDir!, "EA.EplAddIn", version!, "TextBatchEdit");
+                sb.Append("动态候选目录：").Append(dir).Append("。");
+                note = sb.ToString();
+                return Path.Combine(dir, "addin-" + DateTime.Now.ToString("yyyy-MM-dd") + ".log");
+            }
+            sb.Append("设置值或版本为空。");
+        }
+        catch (Exception ex)
+        {
+            sb.Append("读取工作站设置失败：").Append(ex.GetType().Name).Append(": ").Append(ex.Message).Append("。");
+        }
+        note = sb.ToString();
+        return null;
+    }
+
+    /// <summary>把“实际写盘路径 + 动态候选 + 解析过程”作为首条诊断写进日志文件。</summary>
+    private static void EmitStartupDiagnostic(string activeDir)
+    {
+        try
+        {
+            var line = "========== 日志路径诊断 ==========" + Environment.NewLine
+                     + "实际写盘目录：" + activeDir + Environment.NewLine
+                     + "动态候选文件（暂未启用）：" + (DynamicFilePath ?? "(不可用)") + Environment.NewLine
+                     + "动态路径解析过程：" + DynamicNote + Environment.NewLine
+                     + "==================================";
+            var path = Path.Combine(activeDir, "addin-" + DateTime.Now.ToString("yyyy-MM-dd") + ".log");
+            lock (LockObj)
+            {
+                File.AppendAllText(path, line + Environment.NewLine, Encoding.UTF8);
+            }
+        }
+        catch
+        {
+            // 诊断失败不影响插件
+        }
     }
 
     private static bool TryWritable(string dir)
