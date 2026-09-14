@@ -204,8 +204,8 @@ public class TextBatchEditForm : Form
             AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.None,
             SelectionMode = DataGridViewSelectionMode.CellSelect,
             MultiSelect = true,
-            RowHeadersVisible = true,   // 显示窄行首列，供拖拽调整行高（兼作行选择）
-            RowHeadersWidth = 22,
+            RowHeadersVisible = true,   // 最左行首列：显示行号，兼作行选择/拖拽行高
+            RowHeadersWidth = 40,
             AllowUserToResizeRows = true,
             BackgroundColor = System.Drawing.Color.White,
             ClipboardCopyMode = DataGridViewClipboardCopyMode.EnableWithoutHeaderText,
@@ -215,6 +215,15 @@ public class TextBatchEditForm : Form
             EnableHeadersVisualStyles = false, // 允许自定义表头底色
             ColumnHeadersHeightSizeMode = DataGridViewColumnHeadersHeightSizeMode.AutoSize, // 适配双行标题
             GridColor = System.Drawing.Color.FromArgb(170, 170, 170), // 加深网格线，表头/数据行分界更清晰
+            // 行首列（行号列）底色与列标题一致、无列标题；数字居中，选中箭头仍显示在最右
+            RowHeadersDefaultCellStyle = new DataGridViewCellStyle
+            {
+                Alignment = DataGridViewContentAlignment.MiddleCenter,
+                BackColor = System.Drawing.Color.FromArgb(239, 239, 239),
+                ForeColor = System.Drawing.Color.FromArgb(80, 80, 80),
+                SelectionBackColor = System.Drawing.Color.FromArgb(239, 239, 239),
+                SelectionForeColor = System.Drawing.Color.FromArgb(80, 80, 80),
+            },
             ColumnHeadersDefaultCellStyle = new DataGridViewCellStyle
             {
                 Alignment = DataGridViewContentAlignment.BottomCenter, // 标题下部居中
@@ -307,8 +316,8 @@ public class TextBatchEditForm : Form
         _origLangCol.Clear();
         _newLangCol.Clear();
 
-        _grid.Columns.Add("idx", "#");
-        _grid.Columns[ColIndex].Width = 46;
+        _grid.Columns.Add("idx", "序号");
+        _grid.Columns[ColIndex].Width = 50;
         _grid.Columns[ColIndex].ReadOnly = true;
         _grid.Columns[ColIndex].SortMode = DataGridViewColumnSortMode.NotSortable;
 
@@ -454,11 +463,12 @@ public class TextBatchEditForm : Form
                 "  • 显示原值：在左侧展开灰色的“原…”列，方便对照修改前的内容。\n" +
                 "  • 显示源语言：显示/隐藏源语言那一列（原值侧与新值侧各一列）；默认不显示。\n" +
                 "  • 自动保存：开启后编辑停顿即自动写回；关闭后需手动“应用”。默认开启。\n\n" +
-                "【换选中文本】\n" +
-                "  • 窗口常开时，重新在图纸上框选文本再执行命令，表格会刷新为新选择；\n" +
-                "    若有未保存修改会先弹窗（保存并刷新/放弃刷新/取消）。\n\n" +
+                "【换选中文本 / 多页】\n" +
+                "  • 窗口常开时重新框选文本、或在页导航器改选页，再执行命令即可刷新表格；\n" +
+                "  • 除图面框选外，也可在页导航器选中一个或多个页（或高层代号等节点）批量编辑这些页的全部文本；\n" +
+                "  • 若有未保存修改会先弹窗（保存并刷新/放弃刷新/取消）。\n\n" +
                 "【结构/坐标只读列】\n" +
-                "  • 最左列为行号；类型右侧为只读信息：高层代号(=)、安装地点(++)、位置代号(+)、X、Y。\n" +
+                "  • 最左行首列为行号（随当前显示位置变），其后“序号”列是默认排序下的固定编号；类型右侧为只读信息：高层代号(=)、安装地点(++)、位置代号(+)、X、Y。\n" +
                 "  • 结构信息取自文本所在页；默认按“结构标识符管理”里的顺序，再按 X 从小到大、Y 从大到小。\n" +
                 "  • 灰色只读列仅显示，不能修改。\n\n" +
                 "【换行与排版】\n" +
@@ -1075,7 +1085,8 @@ public class TextBatchEditForm : Form
 
                 var rowIdx = _grid.Rows.Add();
                 var row = _grid.Rows[rowIdx];
-                row.Cells[ColIndex].Value = (i + 1).ToString();
+                row.Cells[ColIndex].Value = (i + 1).ToString(); // 临时值，ApplyDefaultOrder 后被固定排名覆盖
+                row.HeaderCell.Value = (i + 1).ToString();       // 行头行号
                 row.Cells[ColType].Value = typeName;
 
                 // 只读结构/坐标信息（坐标排序用原始 double，显示保留 1 位小数）
@@ -1188,8 +1199,9 @@ public class TextBatchEditForm : Form
             IOrderedEnumerable<SortView> primary;
             if (col == ColIndex)
             {
-                // # 列始终是当前显示行号；双击它改为按“开窗原始序号”排序
-                primary = dir > 0 ? views.OrderBy(v => v.Orig) : views.OrderByDescending(v => v.Orig);
+                // 序号列承载“默认排序固定排名”，按数值升=默认序；双击可看倒序
+                double RankNum(SortView v) => double.TryParse(v.Values[col] as string, out var x) ? x : 0;
+                primary = dir > 0 ? views.OrderBy(RankNum) : views.OrderByDescending(RankNum);
             }
             else if (col == ColX)
             {
@@ -1239,8 +1251,10 @@ public class TextBatchEditForm : Form
             {
                 var row = _grid.Rows[_grid.Rows.Add()];
                 for (var c = 0; c < colCount; c++) { row.Cells[c].Value = v.Values[c]; }
-                // 行号列始终显示当前显示位置 1..n（开窗原始序号保存在 Orig，供双击 # 排序）
-                row.Cells[ColIndex].Value = (ri + 1).ToString();
+                // 行头 = 当前显示行号（随排序即时变）；底色与列标题一致、无列标题
+                row.HeaderCell.Value = (ri + 1).ToString();
+                // 序号列：仅在“默认排序”时盖章为固定排名 1..n；按其它列排序时沿用已盖章值（随文本一起搬运）
+                if (dir == 0) { row.Cells[ColIndex].Value = (ri + 1).ToString(); }
                 row.Height = v.Height;
                 SetRowEditable(ri, Convert.ToBoolean(v.Values[ColMultilang] ?? false));
                 ri++;
