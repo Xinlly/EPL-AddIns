@@ -6,6 +6,7 @@ using Eplan.EplApi.HEServices;
 using Eplan.EplApi.Scripting;
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using System.Windows.Forms;
 
@@ -14,6 +15,31 @@ namespace EA.EplAddIn.TextBatchEdit;
 public class TextBatchEditAction : IEplAction
 {
     public const string ActionName = "TextBatchEditAction";
+
+    /// <summary>当前已非模态打开的编辑窗（单例）；关闭后置 null。</summary>
+    private static Form? _openForm;
+
+    /// <summary>把 EPLAN 主窗口句柄包装成 WinForms 属主，使浮动窗始终在主窗之上并随其最小化。</summary>
+    private static IWin32Window? GetMainWindowOwner()
+    {
+        try
+        {
+            var hwnd = Process.GetCurrentProcess().MainWindowHandle;
+            if (hwnd == IntPtr.Zero) { return null; }
+            return new WindowOwner(hwnd);
+        }
+        catch (Exception ex)
+        {
+            AddInLogger.Debug("获取 EPLAN 主窗句柄失败，浮动窗不设属主：" + ex.Message);
+            return null;
+        }
+    }
+
+    private sealed class WindowOwner : IWin32Window
+    {
+        public WindowOwner(IntPtr h) { Handle = h; }
+        public IntPtr Handle { get; }
+    }
 
     /// <summary>当前选择集中是否存在文本对象（TextBase）。供 Execute 与右键菜单钩子共用。</summary>
     public static bool SelectionHasText()
@@ -67,11 +93,24 @@ public class TextBatchEditAction : IEplAction
 
             AddInLogger.Info("项目源语言=" + sourceLang + "，项目语言=[" + string.Join(",", orderedLangs) + "]");
 
-            using (var form = new TextBatchEditForm(texts, sourceLang, orderedLangs))
+            // 非模态常驻：像导航器一样可一直打开、浮动、不阻塞图形编辑器；属主设为 EPLAN 主窗，
+            // 使其始终浮在主窗之上并随主窗最小化。重复触发动作时复用已打开的窗口而不是再开一个。
+            if (_openForm != null && !_openForm.IsDisposed)
             {
-                form.ShowDialog();
+                if (_openForm.WindowState == FormWindowState.Minimized) { _openForm.WindowState = FormWindowState.Normal; }
+                _openForm.BringToFront();
+                return true;
             }
-            AddInLogger.Info("Action Execute: 窗口已关闭");
+
+            var form = new TextBatchEditForm(texts, sourceLang, orderedLangs, project);
+            _openForm = form;
+            form.FormClosed += (_, _) =>
+            {
+                form.Dispose();
+                if (ReferenceEquals(_openForm, form)) { _openForm = null; }
+            };
+            form.Show(GetMainWindowOwner());
+            AddInLogger.Info("Action Execute: 窗口已非模态打开");
             return true;
         }
         catch (Exception ex)

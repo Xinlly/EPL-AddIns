@@ -14,6 +14,7 @@ public class TextBatchEditForm : Form
     private readonly List<TextBase> _texts;
     private readonly ISOCode.Language _sourceLang;
     private readonly List<ISOCode.Language> _projectLangs; // 固定顺序，首位为源语言
+    private readonly Project? _project;
 
     // 每组都有“一个文本/单语言列 + N 个语言列（首位是源语言）”。
     // 文本列与源语言列始终同值、双向同步（未翻译文本的值即落在这对列上）。
@@ -46,18 +47,45 @@ public class TextBatchEditForm : Form
     private int _dragStartHeight;
     private const int ResizeEdge = 5; // 距单元格下边缘多少像素视为拖行高热区
 
-    // 双击列标题三级排序：None(默认原始顺序) → Asc → Desc → None
+    // 双击列标题三级排序：默认(结构→X↑→Y↓) → 升 → 降 → 默认
     private int _sortCol = -1;
-    private int _sortDir; // 0=默认, 1=顺序, -1=倒序
+    private int _sortDir; // 0=默认, 1=升, -1=降
     private readonly List<int> _origIndex = new(); // 每个显示行对应的开窗原始下标（随排序一起重排）
+    private readonly List<RowMeta> _meta = new();  // 每个显示行的只读结构/坐标信息（随排序一起重排）
+
+    // 三段结构标识符在“结构标识符管理”中的顺序表：归一化主标识符 -> 顺序号（越小越靠前）
+    private readonly Dictionary<string, double> _plantRank = new();
+    private readonly Dictionary<string, double> _placeRank = new();
+    private readonly Dictionary<string, double> _locationRank = new();
+
+    /// <summary>一行只读结构/坐标信息，同时承担“默认排序”的键。</summary>
+    private sealed class RowMeta
+    {
+        public string Plant = string.Empty;   // 高层代号显示值
+        public string Place = string.Empty;   // 安装地点显示值
+        public string Location = string.Empty;// 位置代号显示值
+        public double X;
+        public double Y;
+        // 三段结构标识符在“结构标识符管理”中的顺序序号（越小越靠前；未匹配取 double.MaxValue）
+        public double PlantRank = double.MaxValue;
+        public double PlaceRank = double.MaxValue;
+        public double LocationRank = double.MaxValue;
+    }
 
     private const int ColIndex = 0;
     private const int ColType = 1;
-    private const int ColOrigMultilang = 2;   // 原值·多语言（只读复选框）
-    private const int ColOrigNoAuto = 3;      // 原值·不自动翻译（只读复选框）
-    private const int OrigTextCol = 4;        // 原值·文本列
+    // —— 只读结构/坐标信息列（位于“类型”右侧）——
+    private const int ColPlant = 2;        // 高层代号 =
+    private const int ColPlace = 3;        // 安装地点 ++
+    private const int ColLocation = 4;     // 位置代号 +
+    private const int ColX = 5;            // X 坐标
+    private const int ColY = 6;            // Y 坐标
 
-    private const int OrigLangStart = 5;      // 原值·语言列起点
+    private const int ColOrigMultilang = 7;   // 原值·多语言（只读复选框）
+    private const int ColOrigNoAuto = 8;      // 原值·不自动翻译（只读复选框）
+    private const int OrigTextCol = 9;        // 原值·文本列
+
+    private const int OrigLangStart = 10;     // 原值·语言列起点
     private int NewCheckStart => OrigLangStart + _projectLangs.Count;       // 新值复选框起点
     private int ColMultilang => NewCheckStart;      // 新值·多语言（可编辑）
     private int ColNoAutoTrans => NewCheckStart + 1; // 新值·不自动翻译（可编辑）
@@ -86,11 +114,12 @@ public class TextBatchEditForm : Form
     private bool _syncing; // 程序化填充/双向同步时抑制事件联动
 
     public TextBatchEditForm(List<TextBase> texts,
-        ISOCode.Language sourceLang, List<ISOCode.Language> projectLangs)
+        ISOCode.Language sourceLang, List<ISOCode.Language> projectLangs, Project? project = null)
     {
         _texts = texts;
         _sourceLang = sourceLang;
         _projectLangs = projectLangs;
+        _project = project;
         _origTextCol = OrigTextCol;
         _newTextCol = NewTextColIdx;
 
@@ -104,6 +133,8 @@ public class TextBatchEditForm : Form
         BuildTabs();
         BuildBottomBar();
         LoadRows();
+        // 开窗即按默认规则排序：结构标识符管理顺序 → X 升 → Y 降
+        ApplyDefaultOrder();
         UpdateApplyEnabled();
         // 应用层消息过滤器：在消息派发前吞掉编辑态的 Ctrl+Enter，防止被 DataGridView 当成“结束编辑”
         _keyFilter = new CtrlEnterFilter(this);
@@ -117,6 +148,12 @@ public class TextBatchEditForm : Form
         if (_keyFilter != null) { Application.RemoveMessageFilter(_keyFilter); _keyFilter = null; }
         base.OnFormClosed(e);
     }
+
+    /// <summary>
+    /// 像 EPLAN 导航器那样：打开时不抢占键盘焦点，用户可继续操作图形编辑器。
+    /// 真正的“嵌入停靠”EPLAN 2.9 公开 API 不支持，这里以非模态、属主为主窗的常驻浮动窗实现。
+    /// </summary>
+    protected override bool ShowWithoutActivation => true;
 
     /// <summary>由消息过滤器调用：当前正编辑单元格时，在其中插入换行标记 ¶（不退出编辑态）。</summary>
     private bool TryInsertLineBreakAtEditing()
@@ -192,6 +229,13 @@ public class TextBatchEditForm : Form
         _grid.Columns[ColType].Width = 100;
         _grid.Columns[ColType].ReadOnly = true;
         _grid.Columns[ColType].SortMode = DataGridViewColumnSortMode.NotSortable;
+
+        // —— 只读结构/坐标信息列（类型右侧）——
+        AddInfoColumn("plant", "高层代号\n=", ColPlant, 90);
+        AddInfoColumn("place", "安装地点\n++", ColPlace, 90);
+        AddInfoColumn("location", "位置代号\n+", ColLocation, 90);
+        AddInfoColumn("x", "X 坐标", ColX, 80);
+        AddInfoColumn("y", "Y 坐标", ColY, 80);
 
         // —— 原值侧（只读，默认随“显示原值”整体隐藏）——
         _grid.Columns.Add(new DataGridViewCheckBoxColumn { Name = "orig_multilang", HeaderText = "原值\n多语言", Width = 70, ReadOnly = true, Visible = false });
@@ -357,7 +401,7 @@ public class TextBatchEditForm : Form
         {
             Text = "显示源语言",
             Width = 110,
-            Checked = true, // 默认显示源语言两列（含可编辑的新值源语言列）
+            Checked = false, // 默认不显示源语言列（原值侧与新值侧同源列一起隐藏）
             TextAlign = ContentAlignment.MiddleLeft,
             Margin = new Padding(12, 0, 0, 0),
         };
@@ -387,12 +431,18 @@ public class TextBatchEditForm : Form
                 "  • 不自动翻译：勾选后该文本不参与自动翻译。\n\n" +
                 "【上方两个开关】\n" +
                 "  • 显示原值：在左侧展开灰色的“原…”列，方便对照修改前的内容。\n" +
-                "  • 显示源语言：显示/隐藏源语言那一列（原值侧与新值侧各一列）。\n\n" +
+                "  • 显示源语言：显示/隐藏源语言那一列（原值侧与新值侧各一列）；默认不显示。\n\n" +
+                "【结构/坐标只读列】\n" +
+                "  • 类型右侧为只读信息：高层代号(=)、安装地点(++)、位置代号(+)、X、Y 坐标。\n" +
+                "  • 开窗默认按“结构标识符管理”里的顺序排序，再按 X 从小到大、Y 从大到小。\n" +
+                "  • 灰色只读列仅显示，不能修改。\n\n" +
                 "【换行与排版】\n" +
                 "  • 单元格里按 Ctrl+Enter 换行（显示为 ¶，保存后即为真正换行）；也可右键选“换行”。\n" +
                 "  • 拖动格子下边缘可改该行高度，拖动表头分隔线可改列宽；右键“调整列宽”自动适配。\n" +
-                "  • 双击任意列标题可按该列排序：正序 → 倒序 → 恢复原顺序。\n" +
+                "  • 双击任意列标题可按该列排序：升序 → 降序 → 恢复默认排序。\n" +
                 "  • 可像 Excel 一样框选后复制、粘贴、删除。\n\n" +
+                "【窗口用法】\n" +
+                "  • 本窗口为浮动常驻窗口，打开时不抢焦点，可一边操作图形编辑器一边编辑；再次执行命令会回到已打开的窗口。\n\n" +
                 "【格子颜色】\n" +
                 "  • 灰色：只读，不能修改。\n" +
                 "  • 黄色：已修改、还没保存。\n" +
@@ -404,6 +454,27 @@ public class TextBatchEditForm : Form
         tabs.TabPages.Add(tabEdit);
         tabs.TabPages.Add(tabHelp);
         Controls.Add(tabs);
+    }
+
+    /// <summary>新增一个只读结构/坐标信息列：不可排序、灰底；坐标列右对齐。</summary>
+    private void AddInfoColumn(string name, string header, int index, int width)
+    {
+        var col = new DataGridViewTextBoxColumn
+        {
+            Name = name,
+            HeaderText = header,
+            Width = width,
+            ReadOnly = true,
+            SortMode = DataGridViewColumnSortMode.NotSortable, // 双击排序由本类统一处理，箭头自绘
+            DefaultCellStyle = new DataGridViewCellStyle
+            {
+                BackColor = ReadOnlyGray,
+                Alignment = name == "x" || name == "y"
+                    ? DataGridViewContentAlignment.MiddleRight
+                    : DataGridViewContentAlignment.MiddleLeft,
+            },
+        };
+        _grid.Columns.Insert(index, col);
     }
 
     /// <summary>
@@ -556,37 +627,16 @@ public class TextBatchEditForm : Form
         // 只处理“列头”且“当前排序列”
         if (e.RowIndex != -1 || _sortDir == 0 || e.ColumnIndex != _sortCol) { return; }
 
-        // 先让系统照常绘制背景/边框/文字（文字已下部居中），再叠加箭头
+        // 先让系统照常绘制背景/边框/文字（文字已下部居中），再叠加箭头字符
         e.Paint(e.ClipBounds, DataGridViewPaintParts.All);
 
-        const int aw = 9, ah = 7;
-        var right = e.CellBounds.Right - 11;
-        var top = e.CellBounds.Top + (e.CellBounds.Height - ah) / 2;
-
-        Point[] pts;
-        if (_sortDir > 0)
-        {
-            // 向上三角：顶点在上
-            pts = new[]
-            {
-                new Point(right - aw / 2, top),          // 顶点
-                new Point(right, top + ah),              // 右下
-                new Point(right - aw, top + ah),         // 左下
-            };
-        }
-        else
-        {
-            // 向下三角：顶点在下
-            pts = new[]
-            {
-                new Point(right - aw, top),              // 左上
-                new Point(right, top),                   // 右上
-                new Point(right - aw / 2, top + ah),     // 底点
-            };
-        }
-
-        using var b = new SolidBrush(System.Drawing.Color.FromArgb(70, 70, 70));
-        e.Graphics.FillPolygon(b, pts);
+        // 用箭头字符替代自绘多边形（自绘三角在某些 DPI 下看起来是歪的）
+        var arrow = _sortDir > 0 ? "\u25B2" : "\u25BC"; // ▲ / ▼
+        var rect = new System.Drawing.Rectangle(e.CellBounds.Right - 18, e.CellBounds.Top, 15, e.CellBounds.Height);
+        using var arrowFont = new Font(_grid.Font.FontFamily, 7.5f, FontStyle.Regular);
+        TextRenderer.DrawText(e.Graphics, arrow, arrowFont, rect,
+            System.Drawing.Color.FromArgb(70, 70, 70),
+            TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
 
         e.Handled = true;
     }
@@ -714,6 +764,125 @@ public class TextBatchEditForm : Form
         Controls.Add(panel);
     }
 
+    /// <summary>
+    /// 为高层代号/安装地点/位置代号三段分别建立“结构标识符管理”顶层顺序表。
+    /// 顶层节点（无父节点）即页“主标识符”可选取值，按其在管理对话框中的 SortId 升序编号。
+    /// </summary>
+    private void BuildRankMaps()
+    {
+        _plantRank.Clear();
+        _placeRank.Clear();
+        _locationRank.Clear();
+        if (_project == null) { return; }
+        try
+        {
+            FillRank(_project, Project.Hierarchy.Plant, _plantRank);
+            FillRank(_project, Project.Hierarchy.Place, _placeRank);
+            FillRank(_project, Project.Hierarchy.Location, _locationRank);
+        }
+        catch (Exception ex)
+        {
+            AddInLogger.Warn("读取结构标识符管理顺序失败，默认排序退化为名称序：" + ex.Message);
+        }
+    }
+
+    private static void FillRank(Project project, Project.Hierarchy h, Dictionary<string, double> map)
+    {
+        Location[] nodes;
+        try { nodes = project.GetLocationObjects(h); }
+        catch (Exception ex)
+        {
+            AddInLogger.Debug("GetLocationObjects(" + h + ") 失败：" + ex.Message);
+            return;
+        }
+        if (nodes == null || nodes.Length == 0) { return; }
+
+        var roots = new List<Location>();
+        foreach (var node in nodes)
+        {
+            bool isRoot;
+            try { isRoot = node.ParentNode == null; }
+            catch { isRoot = true; } // 取父级异常时按顶层处理，保证不丢排序
+            if (isRoot) { roots.Add(node); }
+        }
+        roots.Sort((a, b) => a.SortId.CompareTo(b.SortId));
+
+        for (var i = 0; i < roots.Count; i++)
+        {
+            var key = NormIdent(roots[i].Name);
+            if (key.Length > 0 && !map.ContainsKey(key)) { map[key] = i; }
+        }
+    }
+
+    /// <summary>归一化结构标识符用于排序匹配：去前缀符号/空白，大写（名称本身一般不含 =/+ 前缀）。</summary>
+    private static string NormIdent(string? s)
+    {
+        if (string.IsNullOrEmpty(s)) { return string.Empty; }
+        var t = s!.Trim();
+        while (t.Length > 0 && (t[0] == '=' || t[0] == '+' || t[0] == '&' || t[0] == '#')) { t = t.Substring(1).Trim(); }
+        return t.ToUpperInvariant();
+    }
+
+    private double RankOf(Dictionary<string, double> map, string ident)
+    {
+        return map.TryGetValue(NormIdent(ident), out var r) ? r : double.MaxValue;
+    }
+
+    /// <summary>读取一个文本对象所属页的三段主结构标识符与图形坐标，组装只读信息（并填好排序 rank）。</summary>
+    private RowMeta BuildMeta(TextBase t)
+    {
+        var m = new RowMeta();
+        try
+        {
+            var page = t.Page;
+            if (page != null)
+            {
+                var pp = page.Properties;
+                m.Plant = PageIdent(pp.DESIGNATION_PLANT);
+                m.Place = PageIdent(pp.DESIGNATION_PLACEOFINSTALLATION);
+                m.Location = PageIdent(pp.DESIGNATION_LOCATION);
+            }
+        }
+        catch (Exception ex)
+        {
+            AddInLogger.Debug("读取结构标识符失败：" + ex.Message);
+        }
+
+        try
+        {
+            var pt = t.Location;
+            m.X = pt.X;
+            m.Y = pt.Y;
+        }
+        catch (Exception ex)
+        {
+            AddInLogger.Debug("读取坐标失败：" + ex.Message);
+        }
+
+        m.PlantRank = RankOf(_plantRank, m.Plant);
+        m.PlaceRank = RankOf(_placeRank, m.Place);
+        m.LocationRank = RankOf(_locationRank, m.Location);
+        return m;
+    }
+
+    private static string PageIdent(PropertyValue? v)
+    {
+        if (v == null || v.IsEmpty) { return string.Empty; }
+        var s = v.ToString();
+        return s == null ? string.Empty : s.Trim();
+    }
+
+    /// <summary>坐标（mm）显示：整数不带小数点，最多 3 位小数。</summary>
+    private static string FormatCoord(double v) => v.ToString("0.###");
+
+    /// <summary>开窗默认排序入口：结构标识符管理顺序 → X 升 → Y 降。</summary>
+    private void ApplyDefaultOrder()
+    {
+        _sortCol = -1;
+        _sortDir = 0;
+        ApplySort(ColIndex, 0);
+    }
+
     private void LoadRows()
     {
         AddInLogger.Info("LoadRows: count=" + _texts.Count
@@ -723,6 +892,8 @@ public class TextBatchEditForm : Form
         _baseline.Clear();
         _initial.Clear();
         _origIndex.Clear();
+        _meta.Clear();
+        BuildRankMaps();
         _syncing = true;
         _grid.Rows.Clear();
         try
@@ -786,6 +957,16 @@ public class TextBatchEditForm : Form
                 var row = _grid.Rows[rowIdx];
                 row.Cells[ColIndex].Value = (i + 1).ToString();
                 row.Cells[ColType].Value = typeName;
+
+                // 只读结构/坐标信息（坐标排序用原始 double，显示保留 1 位小数）
+                var meta = BuildMeta(t);
+                row.Cells[ColPlant].Value = meta.Plant;
+                row.Cells[ColPlace].Value = meta.Place;
+                row.Cells[ColLocation].Value = meta.Location;
+                row.Cells[ColX].Value = FormatCoord(meta.X);
+                row.Cells[ColY].Value = FormatCoord(meta.Y);
+                _meta.Add(meta);
+
                 // 原值侧复选框：打开窗口时的状态（只读，仅对照）
                 row.Cells[ColOrigMultilang].Value = isTranslated;
                 row.Cells[ColOrigNoAuto].Value = noAutoTrans;
@@ -846,6 +1027,7 @@ public class TextBatchEditForm : Form
         public RowState Base = null!;
         public RowState Init = null!;
         public int Orig;
+        public RowMeta Meta = null!;
     }
 
     private void ApplySort(int col, int dir)
@@ -868,46 +1050,63 @@ public class TextBatchEditForm : Form
                 Base = _baseline[i],
                 Init = _initial[i],
                 Orig = _origIndex[i],
+                Meta = _meta[i],
             });
         }
 
-        // 稳定排序：dir=0 按开窗原始下标恢复；升/降按该列值（复选框按布尔、其余按文本）
-        IEnumerable<SortView> q = views;
+        // 稳定排序：
+        //   dir=0（默认/第三档复位）→ 结构标识符管理顺序(高层→安装→位置) → X 升 → Y 降 → 开窗序号
+        //   dir≠0 → 该列值（# 按整数、复选框按布尔、坐标按数值、其余按文本），同值回落到默认规则
+        IEnumerable<SortView> q;
         if (dir == 0)
         {
-            q = views.OrderBy(v => v.Orig);
+            q = DefaultOrdered(views);
         }
         else
         {
             var isCheck = _grid.Columns[col] is DataGridViewCheckBoxColumn;
+            IOrderedEnumerable<SortView> primary;
             if (col == ColIndex)
             {
-                int Num(SortView v) => int.TryParse(v.Values[col] as string, out var x) ? x : 0;
-                q = dir > 0 ? views.OrderBy(Num).ThenBy(v => v.Orig)
-                             : views.OrderByDescending(Num).ThenBy(v => v.Orig);
+                double Num(SortView v) => double.TryParse(v.Values[col] as string, out var x) ? x : 0;
+                primary = dir > 0 ? views.OrderBy(Num) : views.OrderByDescending(Num);
+            }
+            else if (col == ColX)
+            {
+                primary = dir > 0 ? views.OrderBy(v => v.Meta.X) : views.OrderByDescending(v => v.Meta.X);
+            }
+            else if (col == ColY)
+            {
+                // Y 单列排序也尊重用户点击方向；默认规则里的“Y 降”在 DefaultOrdered 内
+                primary = dir > 0 ? views.OrderBy(v => v.Meta.Y) : views.OrderByDescending(v => v.Meta.Y);
             }
             else if (isCheck)
             {
-                q = dir > 0
-                    ? views.OrderBy(v => Convert.ToBoolean(v.Values[col] ?? false) ? 1 : 0).ThenBy(v => v.Orig)
-                    : views.OrderByDescending(v => Convert.ToBoolean(v.Values[col] ?? false) ? 1 : 0).ThenBy(v => v.Orig);
+                primary = dir > 0
+                    ? views.OrderBy(v => Convert.ToBoolean(v.Values[col] ?? false) ? 1 : 0)
+                    : views.OrderByDescending(v => Convert.ToBoolean(v.Values[col] ?? false) ? 1 : 0);
             }
             else
             {
-                q = dir > 0
-                    ? views.OrderBy(v => (v.Values[col] as string) ?? string.Empty).ThenBy(v => v.Orig)
-                    : views.OrderByDescending(v => (v.Values[col] as string) ?? string.Empty).ThenBy(v => v.Orig);
+                primary = dir > 0
+                    ? views.OrderBy(v => (v.Values[col] as string) ?? string.Empty)
+                    : views.OrderByDescending(v => (v.Values[col] as string) ?? string.Empty);
             }
+            // 同值时回落到默认结构顺序，保证排列确定、不随原始网格顺序漂移
+            q = primary
+                .ThenBy(v => v.Meta.PlantRank).ThenBy(v => v.Meta.PlaceRank).ThenBy(v => v.Meta.LocationRank)
+                .ThenBy(v => v.Meta.X).ThenByDescending(v => v.Meta.Y).ThenBy(v => v.Orig);
         }
         var sorted = q.ToList();
 
-        // 同步重排四个并行列表（显示行 i 始终对应 _texts[i]，写回/着色逻辑不变）
+        // 同步重排并行列表（显示行 i 始终对应 _texts[i]，写回/着色逻辑不变）
         for (var i = 0; i < n; i++)
         {
             _texts[i] = sorted[i].T;
             _baseline[i] = sorted[i].Base;
             _initial[i] = sorted[i].Init;
             _origIndex[i] = sorted[i].Orig;
+            _meta[i] = sorted[i].Meta;
         }
 
         // 重建网格行（带回原值与手调行高）
@@ -929,13 +1128,22 @@ public class TextBatchEditForm : Form
             _syncing = false;
         }
 
-        // 触发列头重绘，由 CellPainting 自绘实心排序箭头（不用系统 glyph，避免渲染成斜杠）
+        // 触发列头重绘，由 CellPainting 在当前排序列表头叠加箭头字符
         _grid.Invalidate(_grid.DisplayRectangle);
         _grid.Refresh();
 
         UpdateApplyEnabled();
-        AddInLogger.Debug("排序：列=" + col + " 方向=" + (dir == 0 ? "默认" : dir > 0 ? "升序" : "降序"));
+        AddInLogger.Debug("排序：列=" + col + " 方向=" + (dir == 0 ? "默认(结构→X↑→Y↓)" : dir > 0 ? "升序" : "降序"));
     }
+
+    /// <summary>默认顺序：结构标识符管理顺序（高层代号→安装地点→位置代号）→ X 升 → Y 降 → 开窗序号。</summary>
+    private static IOrderedEnumerable<SortView> DefaultOrdered(IEnumerable<SortView> views) =>
+        views.OrderBy(v => v.Meta.PlantRank)
+             .ThenBy(v => v.Meta.PlaceRank)
+             .ThenBy(v => v.Meta.LocationRank)
+             .ThenBy(v => v.Meta.X)
+             .ThenByDescending(v => v.Meta.Y)
+             .ThenBy(v => v.Orig);
 
     /// <summary>抓取该行当前可写状态（标志 + 各可编辑语言值）作为已保存基线。源语言内容以“中文列”为准（与文本列同步）。</summary>
     private RowState SnapshotRow(int row)
