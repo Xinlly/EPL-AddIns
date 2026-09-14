@@ -64,6 +64,19 @@ public class TextBatchEditAddIn : IEplAddIn
             AddInLogger.Error("右键菜单：注册失败", ex);
         }
 
+        // 页导航器（页树）右键：PmPageObjectTreeDialog / 1007；与图纸右键同名、同一 Action（内部支持图面文本与所选页两路）。
+        try
+        {
+            new EplContextMenu().AddMenuItem(
+                new ContextMenuLocation { DialogName = "PmPageObjectTreeDialog", ContextMenuName = "1007" },
+                CtxMenuText, TextBatchEditAction.ActionName, false, true);
+            AddInLogger.Info("右键菜单：常驻项已注册 (PmPageObjectTreeDialog/1007)");
+        }
+        catch (Exception ex)
+        {
+            AddInLogger.Error("页导航器右键菜单：注册失败", ex);
+        }
+
         InstallHook();
         return true;
     }
@@ -153,18 +166,20 @@ public class TextBatchEditAddIn : IEplAddIn
             string text = sb.ToString().Replace("&", "");
             if (len == 0 || text.IndexOf(CtxMenuText, StringComparison.Ordinal) < 0) { continue; }
 
-            // 命中本插件项。含文本→保留（默认亮、可点）；不含→从本次弹出的临时菜单删除。
-            bool hasText = TextBatchEditAction.SelectionHasText();
-            if (hasText)
+            // 同名项同时挂在图纸(Ged)与页导航器(页树)：任一上下文满足即可点。
+            // 图纸：选中文本；页树：选中页。两路在 Action 内自动区分。
+            bool enabled = TextBatchEditAction.SelectionHasText()
+                || TextBatchEditAction.SelectionHasPage();
+            if (enabled)
             {
-                AddInLogger.Info("右键菜单：选择含文本，保留项 pos=" + i + "（菜单项数=" + count + "）");
+                AddInLogger.Info("右键菜单：选择满足条件（文本或页），保留项 pos=" + i + "（菜单项数=" + count + "）");
             }
             else
             {
                 // MF_BYPOSITION 必须配合 MF_BYCOMMAND=0；DeleteMenu 会立即重排后续项位置
                 bool ok = NativeMethods.DeleteMenu(hMenu, (uint)i, MF_BYPOSITION);
                 int after = NativeMethods.GetMenuItemCount(hMenu);
-                AddInLogger.Info("右键菜单：选择无文本，删除项 pos=" + i
+                AddInLogger.Info("右键菜单：既无文本也无选中页，删除项 pos=" + i
                     + "（删前项数=" + count + "，删后项数=" + after + "，DeleteMenu=" + ok + "）");
             }
             return;
