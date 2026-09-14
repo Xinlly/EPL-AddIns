@@ -29,14 +29,17 @@ public class TextBatchEditForm : Form
 
     // 单元格状态配色
     private static readonly System.Drawing.Color ReadOnlyGray = System.Drawing.Color.FromArgb(225, 225, 225);  // 只读原值（加深）
+    private static readonly System.Drawing.Color InfoHeaderGray = System.Drawing.Color.FromArgb(239, 239, 239);// 结构/坐标只读列（与列头同色）
     private static readonly System.Drawing.Color DirtyYellow = System.Drawing.Color.FromArgb(255, 242, 204);   // 已改未保存
     private static readonly System.Drawing.Color SavedGreen = System.Drawing.Color.FromArgb(221, 244, 223);     // 已改已保存
     private static readonly System.Drawing.Color OrigChangedBlue = System.Drawing.Color.FromArgb(213, 232, 246);// 原值：对应新值已保存改动
+    private static readonly System.Drawing.Color FocusTint = System.Drawing.Color.FromArgb(232, 242, 251);     // 单元格聚焦：所在行/列的极浅蓝
 
     private DataGridView _grid = null!;
     private CheckBox _showOrigChk = null!;
     private CheckBox _showSrcChk = null!;
     private CheckBox _autoSaveChk = null!;
+    private CheckBox _focusCellChk = null!;
     private Label _statusLabel = null!;
     private Button _okBtn = null!;
     private Button _cancelBtn = null!;
@@ -205,7 +208,8 @@ public class TextBatchEditForm : Form
             SelectionMode = DataGridViewSelectionMode.CellSelect,
             MultiSelect = true,
             RowHeadersVisible = true,   // 最左行首列：显示行号，兼作行选择/拖拽行高
-            RowHeadersWidth = 40,
+            // 强制按最宽行号内容自适应列宽；该模式下行首宽度恒由内容决定，用户拖拽会被自动值覆盖（即禁止手动调宽）
+            RowHeadersWidthSizeMode = DataGridViewRowHeadersWidthSizeMode.AutoSizeToAllHeaders,
             AllowUserToResizeRows = true,
             BackgroundColor = System.Drawing.Color.White,
             ClipboardCopyMode = DataGridViewClipboardCopyMode.EnableWithoutHeaderText,
@@ -284,8 +288,9 @@ public class TextBatchEditForm : Form
 
         _grid.KeyDown += GridOnKeyDown;
         _grid.ColumnHeaderMouseDoubleClick += GridOnHeaderDoubleClick; // 双击表头：顺序/倒序/默认
-        _grid.CellMouseClick += GridOnCellMouseClick;
+        _grid.CellMouseDown += GridOnCellMouseDown;
         _grid.CellFormatting += GridOnCellFormatting; // 统一单元格状态着色
+        _grid.CurrentCellChanged += (_, _) => { if (_focusCellChk is { Checked: true }) { _grid.Invalidate(); } };
         _grid.CellPainting += GridOnCellPainting;     // 自绘列头排序箭头
         // 任意单元格下边缘拖拽调行高
         _grid.MouseDown += GridOnMouseDownForRowResize;
@@ -330,8 +335,8 @@ public class TextBatchEditForm : Form
         AddInfoColumn("plant", "高层代号\n=", ColPlant, 90);
         AddInfoColumn("place", "安装地点\n++", ColPlace, 90);
         AddInfoColumn("location", "位置代号\n+", ColLocation, 90);
-        AddInfoColumn("x", "X 坐标", ColX, 80);
-        AddInfoColumn("y", "Y 坐标", ColY, 80);
+        AddInfoColumn("x", "x", ColX, 60);
+        AddInfoColumn("y", "y", ColY, 60);
 
         // —— 原值侧（只读，默认随“显示原值”整体隐藏）——
         _grid.Columns.Add(new DataGridViewCheckBoxColumn { Name = "orig_multilang", HeaderText = "原值\n多语言", Width = 70, ReadOnly = true, Visible = false });
@@ -436,9 +441,13 @@ public class TextBatchEditForm : Form
         _autoSaveChk = MakeToggle("自动保存", 96, true);     // 默认开启：编辑结束即写回
         _autoSaveChk.CheckedChanged += (_, _) => OnAutoSaveToggled();
 
+        _focusCellChk = MakeToggle("单元格聚焦", 108, true); // 默认开启：当前格所在行/列浅底
+        _focusCellChk.CheckedChanged += (_, _) => _grid.Invalidate();
+
         barFlow.Controls.Add(_showOrigChk);
         barFlow.Controls.Add(_showSrcChk);
         barFlow.Controls.Add(_autoSaveChk);
+        barFlow.Controls.Add(_focusCellChk);
         bar.Controls.Add(barFlow);
 
         tabEdit.Controls.Add(_grid); // 先加：Fill 占满
@@ -462,7 +471,8 @@ public class TextBatchEditForm : Form
                 "【上方开关】\n" +
                 "  • 显示原值：在左侧展开灰色的“原…”列，方便对照修改前的内容。\n" +
                 "  • 显示源语言：显示/隐藏源语言那一列（原值侧与新值侧各一列）；默认不显示。\n" +
-                "  • 自动保存：开启后编辑停顿即自动写回；关闭后需手动“应用”。默认开启。\n\n" +
+                "  • 自动保存：开启后编辑停顿即自动写回；关闭后需手动“应用”。默认开启。\n" +
+                "  • 单元格聚焦：开启后当前格所在的整行、整列（不含当前格本身）置极浅底色，方便对齐查看。默认开启。\n\n" +
                 "【换选中文本 / 多页】\n" +
                 "  • 窗口常开时重新框选文本、或在页导航器改选页，再执行命令即可刷新表格；\n" +
                 "  • 除图面框选外，也可在页导航器选中一个或多个页（或高层代号等节点）批量编辑这些页的全部文本；\n" +
@@ -503,7 +513,7 @@ public class TextBatchEditForm : Form
             SortMode = DataGridViewColumnSortMode.NotSortable, // 双击排序由本类统一处理，箭头自绘
             DefaultCellStyle = new DataGridViewCellStyle
             {
-                BackColor = ReadOnlyGray,
+                BackColor = InfoHeaderGray, // 结构/坐标只读列底色与列标题一致
                 Alignment = name == "x" || name == "y"
                     ? DataGridViewContentAlignment.MiddleRight
                     : DataGridViewContentAlignment.MiddleLeft,
@@ -633,22 +643,34 @@ public class TextBatchEditForm : Form
         var col = e.ColumnIndex;
         if (row < 0 || row >= _baseline.Count) { return; }
 
-        // 原值侧
+        // 1) 先定基础状态色（结构/坐标等只读信息列不进下面两支，保留列默认灰）
         if (IsOrigCol(col))
         {
             var newCol = CorrespondingNewCol(col);
             e.CellStyle!.BackColor =
                 (!CellIsDirty(row, newCol) && CellSavedChanged(row, newCol)) ? OrigChangedBlue : ReadOnlyGray;
-            return;
         }
-
-        // 新值侧复选框 / 文本
-        if (IsEditableStateCol(col))
+        else if (IsEditableStateCol(col))
         {
             if (CellIsDirty(row, col)) { e.CellStyle!.BackColor = DirtyYellow; }
             else if (CellSavedChanged(row, col)) { e.CellStyle!.BackColor = SavedGreen; }
             else if (_grid[col, row].ReadOnly) { e.CellStyle!.BackColor = ReadOnlyGray; }
             // else 保持默认白底
+        }
+
+        // 2) 单元格聚焦：当前格所在行/列（排除当前格本身）整体置极浅蓝，覆盖在状态色之上
+        if (_focusCellChk is { Checked: true })
+        {
+            var cur = _grid.CurrentCell;
+            if (cur != null)
+            {
+                var sameRow = cur.RowIndex == row;
+                var sameCol = cur.ColumnIndex == col;
+                if ((sameRow || sameCol) && !(sameRow && sameCol))
+                {
+                    e.CellStyle!.BackColor = FocusTint;
+                }
+            }
         }
     }
 
@@ -1266,6 +1288,7 @@ public class TextBatchEditForm : Form
         }
 
         // 触发列头重绘，由 CellPainting 在当前排序列表头叠加箭头字符
+        _grid.AutoResizeRowHeadersWidth(DataGridViewRowHeadersWidthSizeMode.AutoSizeToAllHeaders); // 行号位数变化时列宽跟随
         _grid.Invalidate(_grid.DisplayRectangle);
         _grid.Refresh();
 
@@ -1394,12 +1417,20 @@ public class TextBatchEditForm : Form
         ScheduleAutoSave(); // 当前格未提交也计时；SaveDirty 开头会先 EndEdit 提交
     }
 
-    private void GridOnCellMouseClick(object? s, DataGridViewCellMouseEventArgs e)
+    /// <summary>
+    /// 右键在 MouseUp 才弹出菜单，故用 MouseDown 提前校正目标：
+    /// 右键点中的格子若不在当前选区（如已选 A1 却右键 B1），先清空多选并只选中该格，
+    /// 随后弹出的复制/剪切/粘贴/清除等即以该格（新选区）为目标；右键本就在选区内则保留多选。
+    /// </summary>
+    private void GridOnCellMouseDown(object? s, DataGridViewCellMouseEventArgs e)
     {
         if (e.Button != MouseButtons.Right || e.RowIndex < 0 || e.ColumnIndex < 0) { return; }
-        if (!_grid[e.ColumnIndex, e.RowIndex].Selected)
+        var target = _grid[e.ColumnIndex, e.RowIndex];
+        if (!target.Selected)
         {
-            _grid.CurrentCell = _grid[e.ColumnIndex, e.RowIndex];
+            _grid.ClearSelection();
+            target.Selected = true;
+            _grid.CurrentCell = target;
         }
     }
 
