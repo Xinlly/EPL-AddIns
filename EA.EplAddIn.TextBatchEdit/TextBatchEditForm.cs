@@ -1153,15 +1153,16 @@ public class TextBatchEditForm : Form
             var page = t.Page;
             if (page != null)
             {
-                // “页”列只放纯页名（NameParts.PAGE_NAME，不含结构段）；结构段另有高层/安装/位置列。
-                m.PageName = PageIdent(page.NameParts.PAGE_NAME);
+                // “页”列只放纯页名：从完整页名（=高层+位置/页号）按最后一个 '/' 去掉结构段。
+                // 与导航器可见的完整页名严格同源；PAGE_NAME(#11000) 是默认可空的描述性名称，不能用它。
+                m.PageName = ExtractPageName(page.Name);
                 var pp = page.Properties;
                 // 用“完整/已解析”属性：继承上级页、含子结构的实际标识；未展开段 DESIGNATION_PLANT 可能为空。
                 m.Plant = PageIdent(pp.DESIGNATION_FULLPLANT);
                 m.Place = PageIdent(pp.DESIGNATION_FULLPLACEOFINSTALLATION);
                 m.Location = PageIdent(pp.DESIGNATION_FULLLOCATION);
                 AddInLogger.Debug("页结构 完整页名=" + (page.Name ?? string.Empty)
-                    + " 页名=[" + m.PageName + "]"
+                    + " 纯页名=[" + m.PageName + "]"
                     + " 高层=[" + m.Plant + "] 安装=[" + m.Place + "] 位置=[" + m.Location + "]");
             }
         }
@@ -1192,6 +1193,18 @@ public class TextBatchEditForm : Form
         if (v == null || v.IsEmpty) { return string.Empty; }
         var s = v.ToString();
         return s == null ? string.Empty : s.Trim();
+    }
+
+    /// <summary>
+    /// 从完整页名取纯页名：完整名形如“=高层+安装+位置/页号”，结构段与页号以最后一个 '/' 分隔。
+    /// 页号本身不含 '/'；无结构前缀（无 '/'）时整体即页名。null/空白返回空串。
+    /// </summary>
+    private static string ExtractPageName(string? fullName)
+    {
+        if (string.IsNullOrEmpty(fullName)) { return string.Empty; }
+        var s = fullName!.Trim();
+        var slash = s.LastIndexOf('/');
+        return slash >= 0 ? s.Substring(slash + 1).Trim() : s;
     }
 
     /// <summary>项目稳定标识（链接完整路径）；取不到时退化为 null。用于判断是否同一项目。</summary>
