@@ -398,7 +398,7 @@ public class TextBatchEditForm : Form
         menu.Items.Add("还原选中的行(&R)", null, (_, _) => RestoreSelectedRows());
         menu.Items.Add("还原当前值(&V)", null, (_, _) => RestoreCurrentValue());
         menu.Items.Add("换行(&L)", null, (_, _) => InsertLineBreakIntoCurrent()); // 快捷键不可用时的兜底入口
-        menu.Items.Add("转到图形(&G)", null, (_, _) => GoToGraphic());             // 打开对象所在页并在图形编辑器中选中它
+        menu.Items.Add("转到图形(&G)\tCtrl+J", null, (_, _) => GoToGraphic()); // 打开对象所在页并在图形编辑器中选中它
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("调整列宽(&A)", null, (_, _) => AutoFitColumns());
         menu.Items.Add("调整行高(&H)", null, (_, _) => ResetRowHeights());
@@ -441,6 +441,12 @@ public class TextBatchEditForm : Form
         };
         _grid.IsGridEditing = IsEditing;
         _grid.ZoomGrid = ZoomGrid;
+        // Ctrl+J：转到图形。触发前先结束当前编辑（提交在途输入），避免跳走丢字。
+        _grid.GoToGraphicCommand = () =>
+        {
+            if (_grid.IsCurrentCellInEditMode) { _grid.EndEdit(); }
+            GoToGraphic();
+        };
         _grid.CellFormatting += GridOnCellFormatting; // 统一单元格状态着色
         _grid.CurrentCellChanged += (_, _) =>
         {
@@ -662,6 +668,7 @@ public class TextBatchEditForm : Form
                 "  • 右键“还原选中的行/还原当前值”可恢复到打开窗口时的原值（即使已保存也可还原，再保存即写回）。\n\n" +
                 "【窗口用法】\n" +
                 "  • 本窗口为浮动常驻窗口，打开时不抢焦点，可一边操作图形编辑器一边编辑；再次执行命令会回到已打开的窗口。\n" +
+                "  • 选中行后右键“转到图形”或按 Ctrl+J：打开该文本所在页并在图形编辑器中定位、选中它。\n" +
                 "  • 按住 Ctrl 滚动鼠标滚轮可放大/缩小表格字体、行高与列宽（0.7～1.8 倍）。\n\n" +
                 "【格子颜色】\n" +
                 "  • 灰色：只读，不能修改。\n" +
@@ -2375,6 +2382,7 @@ public class TextBatchEditForm : Form
         public Action<Keys>? GridClipboardCommand;
         public Func<bool>? IsGridEditing;
         public Action<bool>? ZoomGrid; // 参数：true=放大，false=缩小
+        public Action? GoToGraphicCommand; // Ctrl+J：转到图形（编辑态也生效）
 
         protected override void OnMouseWheel(MouseEventArgs e)
         {
@@ -2391,6 +2399,12 @@ public class TextBatchEditForm : Form
         protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
         {
             var key = keyData & Keys.KeyCode;
+            // Ctrl+J：转到图形（编辑态也生效，回调内先 EndEdit 提交当前编辑）
+            if ((keyData & Keys.Control) == Keys.Control && key == Keys.J)
+            {
+                GoToGraphicCommand?.Invoke();
+                return true;
+            }
             if ((keyData & Keys.Control) == Keys.Control
                 && !(IsGridEditing?.Invoke() ?? false)
                 && (key == Keys.C || key == Keys.X || key == Keys.V))
