@@ -212,29 +212,48 @@ public class TextBatchEditAction : IEplAction
     }
 
     /// <summary>
-    /// 源语言：项目设置 TRANSLATEGUI.SOURCE_LANGUAGE（ProjectSettings 已锚定 PROJECT，键不带前缀），
-    /// 失败回退只读属性 PROJ_SOURCELANGUAGE。
+    /// 源语言：项目设置 TRANSLATEGUI.SOURCE_LANGUAGE（ProjectSettings 已锚定 PROJECT，键不带前缀）。
+    /// 当项目源语言选择“##_##（对话语言）”时，设置值/只读属性可能返回占位编号 119（不是有效语言枚举），
+    /// 此时改从用户层级对话框语言 USER.SYSTEM.GUI.LANGUAGE 解析真实语言；失败再读 Languages.GuiLanguage。
     /// </summary>
     private static ISOCode.Language ReadSourceLanguage(Project project)
     {
-        // 1) TRANSLATEGUI.SOURCE_LANGUAGE（单值，索引 0，如 zh_CN）
+        // 1) TRANSLATEGUI.SOURCE_LANGUAGE（单值，索引 0，如 zh_CN；对话语言占位值可能为 119 或 ##_##）
         try
         {
             var raw = project.Settings.GetStringSetting("TRANSLATEGUI.SOURCE_LANGUAGE", 0);
             AddInLogger.Debug("TRANSLATEGUI.SOURCE_LANGUAGE 设置原始值=" + (raw == null ? "(null)" : "[" + raw + "]"));
-            if (LangHelper.TryParse(raw, out var l)) { return l; }
+
+            if (IsDialogLanguagePlaceholder(raw))
+            {
+                var dialogLanguage = ReadDialogLanguage();
+                if (dialogLanguage.HasValue) { return dialogLanguage.Value; }
+            }
+            else if (LangHelper.TryParse(raw, out var l))
+            {
+                return l;
+            }
         }
         catch (Exception ex)
         {
             AddInLogger.Debug("读取 TRANSLATEGUI.SOURCE_LANGUAGE 失败，回退属性：" + ex.GetType().Name + " " + ex.Message);
         }
 
-        // 2) 只读项目属性 PROJ_SOURCELANGUAGE（Int64 语言编号）
+        // 2) 只读项目属性 PROJ_SOURCELANGUAGE（Int64 语言编号；对话语言占位时同样可能是 119）
         try
         {
             var id = project.Properties.PROJ_SOURCELANGUAGE.ToInt();
             AddInLogger.Debug("PROJ_SOURCELANGUAGE 属性编号=" + id);
-            if (Enum.IsDefined(typeof(ISOCode.Language), id)) { return (ISOCode.Language)id; }
+
+            if (id == DialogLanguagePlaceholderId)
+            {
+                var dialogLanguage = ReadDialogLanguage();
+                if (dialogLanguage.HasValue) { return dialogLanguage.Value; }
+            }
+            else if (Enum.IsDefined(typeof(ISOCode.Language), id))
+            {
+                return (ISOCode.Language)id;
+            }
         }
         catch (Exception ex)
         {
@@ -243,6 +262,66 @@ public class TextBatchEditAction : IEplAction
 
         AddInLogger.Warn("无法确定源语言，默认 zh_CN");
         return ISOCode.Language.L_zh_CN;
+    }
+
+    private const int DialogLanguagePlaceholderId = 119;
+
+    /// <summary>
+    /// 判断项目源语言设置是否为“##_##（对话语言）”占位值。已确认 2.9.4 中 119 不是 ISOCode.Language 枚举成员。
+    /// </summary>
+    private static bool IsDialogLanguagePlaceholder(string? raw)
+    {
+        var s = raw == null ? string.Empty : raw.Trim();
+        if (s.Length == 0) { return false; }
+        if (s == "##_##" || string.Equals(s, "L___", StringComparison.Ordinal)) { return true; }
+
+        return int.TryParse(s, out var id) && id == DialogLanguagePlaceholderId;
+    }
+
+    /// <summary>
+    /// 读取当前 EPLAN 对话框语言：优先用户设置 USER.SYSTEM.GUI.LANGUAGE（Settings 默认 USER 级，不带 USER. 前缀），
+    /// 再用运行时 API Languages.GuiLanguage 兜底。
+    /// </summary>
+    private static ISOCode.Language? ReadDialogLanguage()
+    {
+        try
+        {
+            var settings = new Settings();
+            const string settingPath = "SYSTEM.GUI.LANGUAGE";
+            if (settings.ExistSetting(settingPath))
+            {
+                var raw = settings.GetStringSetting(settingPath, 0);
+                AddInLogger.Debug("源语言为对话语言占位值，USER.SYSTEM.GUI.LANGUAGE 原始值=" + (raw == null ? "(null)" : "[" + raw + "]"));
+                if (LangHelper.TryParse(raw, out var lang))
+                {
+                    AddInLogger.Info("项目源语言=对话语言，按用户对话框语言解析为 " + lang);
+                    return lang;
+                }
+            }
+            else
+            {
+                AddInLogger.Debug("用户设置 SYSTEM.GUI.LANGUAGE 不存在，尝试 Languages.GuiLanguage");
+            }
+        }
+        catch (Exception ex)
+        {
+            AddInLogger.Debug("读取用户对话框语言设置失败，尝试 Languages.GuiLanguage：" + ex.GetType().Name + " " + ex.Message);
+        }
+
+        try
+        {
+            using (var languages = new Languages())
+            {
+                var lang = languages.GuiLanguage.GetNumber();
+                AddInLogger.Info("项目源语言=对话语言，按 Languages.GuiLanguage 解析为 " + lang);
+                return lang;
+            }
+        }
+        catch (Exception ex)
+        {
+            AddInLogger.Error("读取 Languages.GuiLanguage 失败", ex);
+            return null;
+        }
     }
 
     /// <summary>
