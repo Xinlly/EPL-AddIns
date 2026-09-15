@@ -50,6 +50,7 @@ public class TextBatchEditForm : Form
     private Button _applyBtn = null!;
     private CtrlEnterFilter? _keyFilter;
     private ClipboardKeyFilter? _clipFilter;
+    private CtrlJFilter? _ctrlJFilter;
     private Timer? _autoSaveTimer;
     private bool _saving; // 抑制保存/刷新过程中自动保存的重入
 
@@ -189,6 +190,8 @@ public class TextBatchEditForm : Form
         Application.AddMessageFilter(_keyFilter);
         _clipFilter = new ClipboardKeyFilter(this);
         Application.AddMessageFilter(_clipFilter);
+        _ctrlJFilter = new CtrlJFilter(this);
+        Application.AddMessageFilter(_ctrlJFilter);
         // 窗体真正显示（grid 句柄已建）后：按两个开关初始化列可见性（内含一次自动列宽）
         Shown += (_, _) => UpdateColumnVisibility();
     }
@@ -198,6 +201,7 @@ public class TextBatchEditForm : Form
         DisposeAutoSaveTimer();
         if (_keyFilter != null) { Application.RemoveMessageFilter(_keyFilter); _keyFilter = null; }
         if (_clipFilter != null) { Application.RemoveMessageFilter(_clipFilter); _clipFilter = null; }
+        if (_ctrlJFilter != null) { Application.RemoveMessageFilter(_ctrlJFilter); _ctrlJFilter = null; }
         _appliedGridFont?.Dispose(); // 仅释放缩放时新建的字体；基准字体是系统默认字体，不释放
         _appliedGridFont = null;
         base.OnFormClosed(e);
@@ -275,6 +279,50 @@ public class TextBatchEditForm : Form
             else if (key == Keys.X) { _form.CutSelection(); }
             else { _form.PasteClipboard(); }
             return true; // 吞掉，宿主复选框/grid 都不再收到
+        }
+
+        private static bool IsInGrid(Control c, Control grid)
+        {
+            for (var p = c; p != null; p = p.Parent) { if (p == grid) { return true; } }
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// 应用层 Ctrl+J 过滤器：在表格范围内（含编辑控件聚焦时）转到图形。
+    /// 关键点：
+    ///  - 中文输入法开启时字母键走 WM_IME_KEYDOWN(0x0290) 而非 WM_KEYDOWN，必须两者都认；
+    ///  - 本窗 ShowWithoutActivation，Form.ActiveForm 可能是 EPLAN 主窗，故作用域只看“消息目标是否在 grid 内”，不看 ActiveForm；
+    ///  - 编辑态另有 LineBreakTextBox.WndProc 兜底（更早一层），二者不会重复：本过滤器吞掉后窗口过程收不到。
+    /// </summary>
+    private sealed class CtrlJFilter : IMessageFilter
+    {
+        private const int WM_KEYDOWN = 0x0100;
+        private const int WM_IME_KEYDOWN = 0x0290;
+        private readonly TextBatchEditForm _form;
+
+        public CtrlJFilter(TextBatchEditForm form) { _form = form; }
+
+        public bool PreFilterMessage(ref Message m)
+        {
+            if (m.Msg != WM_KEYDOWN && m.Msg != WM_IME_KEYDOWN) { return false; }
+            if ((Control.ModifierKeys & Keys.Control) == 0) { return false; }
+            var key = (Keys)(int)m.WParam & Keys.KeyCode;
+            if (key != Keys.J) { return false; }
+            if ((Control.ModifierKeys & Keys.Alt) != 0) { return false; } // 排除 Ctrl+Alt+J 等
+
+            var g = _form._grid;
+            if (g is not { IsHandleCreated: true }) { return false; }
+            var focused = Control.FromHandle(m.HWnd);
+            var inGrid = focused != null && IsInGrid(focused, g);
+            // 受控诊断：仅在按下 Ctrl+J 时记录一条，便于实机判断消息是否到达 .NET 泵、焦点落在哪个控件
+            AddInLogger.Debug("Ctrl+J 过滤器：msg=0x" + m.Msg.ToString("X3")
+                + " 目标控件=" + (focused == null ? "null" : focused.GetType().Name)
+                + " 在表格内=" + inGrid);
+            if (!inGrid) { return false; }
+
+            _form.GoToGraphicFromShortcut();
+            return true; // 吞掉，宿主与 grid 都不再收到
         }
 
         private static bool IsInGrid(Control c, Control grid)
@@ -389,19 +437,21 @@ public class TextBatchEditForm : Form
             ScheduleAutoSave();
         };
 
-        // 右键菜单
+        // 右键菜单（非编辑态，作用于网格选区）。
+        // 视觉对齐 EPLAN：左侧纯功能名，右侧统一快捷键列（ShortcutKeyDisplayString 自动右对齐到菜单右边界）。
+        // 不在文本里写 (&X)：那是访问键、会夹在文字中间显得错位；实际按键由消息过滤器/命令键处理，不靠菜单 ShortcutKeys（避免与宿主抢键）。
         var menu = new ContextMenuStrip();
-        menu.Items.Add("复制(&C)", null, (_, _) => CopySelection());
-        menu.Items.Add("剪切(&X)", null, (_, _) => CutSelection());
-        menu.Items.Add("粘贴(&V)", null, (_, _) => PasteClipboard());
-        menu.Items.Add("清除内容(&D)", null, (_, _) => ClearSelection());
-        menu.Items.Add("还原选中的行(&R)", null, (_, _) => RestoreSelectedRows());
-        menu.Items.Add("还原当前值(&V)", null, (_, _) => RestoreCurrentValue());
-        menu.Items.Add("换行(&L)", null, (_, _) => InsertLineBreakIntoCurrent()); // 快捷键不可用时的兜底入口
-        menu.Items.Add("转到图形(&G)\tCtrl+J", null, (_, _) => GoToGraphic()); // 打开对象所在页并在图形编辑器中选中它
+        menu.Items.Add(MakeMenuItem("复制", "Ctrl+C", (_, _) => CopySelection()));
+        menu.Items.Add(MakeMenuItem("剪切", "Ctrl+X", (_, _) => CutSelection()));
+        menu.Items.Add(MakeMenuItem("粘贴", "Ctrl+V", (_, _) => PasteClipboard()));
+        menu.Items.Add(MakeMenuItem("清除内容", "Del", (_, _) => ClearSelection()));
+        menu.Items.Add(MakeMenuItem("还原选中的行", null, (_, _) => RestoreSelectedRows()));
+        menu.Items.Add(MakeMenuItem("还原当前值", null, (_, _) => RestoreCurrentValue()));
+        menu.Items.Add(MakeMenuItem("换行", "Ctrl+Enter", (_, _) => InsertLineBreakIntoCurrent())); // 非编辑态点击会提示先选可编辑格
+        menu.Items.Add(MakeMenuItem("转到图形", "Ctrl+J", (_, _) => GoToGraphic()));
         menu.Items.Add(new ToolStripSeparator());
-        menu.Items.Add("调整列宽(&A)", null, (_, _) => AutoFitColumns());
-        menu.Items.Add("调整行高(&H)", null, (_, _) => ResetRowHeights());
+        menu.Items.Add(MakeMenuItem("调整列宽", null, (_, _) => AutoFitColumns()));
+        menu.Items.Add(MakeMenuItem("调整行高", null, (_, _) => ResetRowHeights()));
         _grid.ContextMenuStrip = menu;
 
         _grid.KeyDown += GridOnKeyDown;
@@ -441,12 +491,6 @@ public class TextBatchEditForm : Form
         };
         _grid.IsGridEditing = IsEditing;
         _grid.ZoomGrid = ZoomGrid;
-        // Ctrl+J：转到图形。触发前先结束当前编辑（提交在途输入），避免跳走丢字。
-        _grid.GoToGraphicCommand = () =>
-        {
-            if (_grid.IsCurrentCellInEditMode) { _grid.EndEdit(); }
-            GoToGraphic();
-        };
         _grid.CellFormatting += GridOnCellFormatting; // 统一单元格状态着色
         _grid.CurrentCellChanged += (_, _) =>
         {
@@ -463,6 +507,9 @@ public class TextBatchEditForm : Form
             {
                 tb.TextChanged -= EditingTextChanged;
                 tb.TextChanged += EditingTextChanged;
+                // 编辑态承载焦点的是内嵌文本框，默认用系统菜单（没有我们的“换行/转到图形”）；
+                // 显式挂专用菜单，保证编辑中右键也能插入 ¶、转到图形。
+                tb.ContextMenuStrip = BuildEditMenu(tb);
             }
         };
         _grid.DataError += (_, e) =>
@@ -470,6 +517,38 @@ public class TextBatchEditForm : Form
             AddInLogger.Warn("网格 DataError: ctx=" + e.Context + " " + (e.Exception?.Message ?? ""));
             e.ThrowException = false;
         };
+    }
+
+    /// <summary>构造统一风格的右键菜单项：左侧纯功能名，右侧快捷键列（ToolStrip 自动右对齐到菜单右边界）。
+    /// shortcut 传 null 则不显示快捷键列。不设 ShortcutKeys，按键行为统一由消息过滤器/命令键接管。</summary>
+    private static ToolStripMenuItem MakeMenuItem(string text, string? shortcut, EventHandler onClick)
+    {
+        var item = new ToolStripMenuItem(text, null, onClick);
+        if (!string.IsNullOrEmpty(shortcut)) { item.ShortcutKeyDisplayString = shortcut; }
+        return item;
+    }
+
+    /// <summary>单元格编辑态右键菜单：承载焦点的是内嵌文本框，作用于框内选区；风格与主菜单一致。</summary>
+    private ContextMenuStrip BuildEditMenu(TextBox tb)
+    {
+        var m = new ContextMenuStrip();
+        m.Items.Add(MakeMenuItem("剪切", "Ctrl+X", (_, _) => tb.Cut()));
+        m.Items.Add(MakeMenuItem("复制", "Ctrl+C", (_, _) => tb.Copy()));
+        // 手动粘贴：与 LineBreakTextBox.WndProc 的 WM_PASTE 一致，把多行剪贴板的真实换行转成 ¶ 放进同一格
+        m.Items.Add(MakeMenuItem("粘贴", "Ctrl+V", (_, _) =>
+        {
+            if (!Clipboard.ContainsText()) { return; }
+            var raw = Clipboard.GetText();
+            var oneLine = raw.Replace("\r\n", "\n").Replace('\r', '\n').TrimEnd('\n').Replace('\n', '¶');
+            tb.SelectedText = oneLine;
+        }));
+        m.Items.Add(MakeMenuItem("删除", "Del", (_, _) => { tb.SelectedText = string.Empty; }));
+        m.Items.Add(new ToolStripSeparator());
+        m.Items.Add(MakeMenuItem("全选", "Ctrl+A", (_, _) => tb.SelectAll()));
+        m.Items.Add(new ToolStripSeparator());
+        m.Items.Add(MakeMenuItem("换行", "Ctrl+Enter", (_, _) => TryInsertLineBreakAtEditing()));
+        m.Items.Add(MakeMenuItem("转到图形", "Ctrl+J", (_, _) => GoToGraphicFromShortcut()));
+        return m;
     }
 
     /// <summary>创建全部列。首次构建调用；同一窗口/同一项目内刷新选择集时列结构不变，仅重建行。</summary>
@@ -669,6 +748,7 @@ public class TextBatchEditForm : Form
                 "【窗口用法】\n" +
                 "  • 本窗口为浮动常驻窗口，打开时不抢焦点，可一边操作图形编辑器一边编辑；再次执行命令会回到已打开的窗口。\n" +
                 "  • 选中行后右键“转到图形”或按 Ctrl+J：打开该文本所在页并在图形编辑器中定位、选中它。\n" +
+                "  • 非编辑态右键作用于表格选区（复制/剪切/粘贴/清除/还原/换行/转到图形等）；双击进入单元格编辑后右键是文本框菜单（剪切/复制/粘贴/删除/全选/换行/转到图形）。\n" +
                 "  • 按住 Ctrl 滚动鼠标滚轮可放大/缩小表格字体、行高与列宽（0.7～1.8 倍）。\n\n" +
                 "【格子颜色】\n" +
                 "  • 灰色：只读，不能修改。\n" +
@@ -835,6 +915,13 @@ public class TextBatchEditForm : Form
         }
         // 文本列（单语言内容）始终可编辑
         _grid[_newTextCol, row].ReadOnly = false;
+    }
+
+    // —— Ctrl+J 快捷键入口：先提交在途编辑再转到图形（右键菜单直接走 GoToGraphic）——
+    private void GoToGraphicFromShortcut()
+    {
+        if (_grid.IsCurrentCellInEditMode) { _grid.EndEdit(); }
+        GoToGraphic();
     }
 
     // —— 右键菜单“转到图形”：打开选中行对象所在页，并在图形编辑器中选中该对象 ——
@@ -2382,7 +2469,6 @@ public class TextBatchEditForm : Form
         public Action<Keys>? GridClipboardCommand;
         public Func<bool>? IsGridEditing;
         public Action<bool>? ZoomGrid; // 参数：true=放大，false=缩小
-        public Action? GoToGraphicCommand; // Ctrl+J：转到图形（编辑态也生效）
 
         protected override void OnMouseWheel(MouseEventArgs e)
         {
@@ -2399,12 +2485,6 @@ public class TextBatchEditForm : Form
         protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
         {
             var key = keyData & Keys.KeyCode;
-            // Ctrl+J：转到图形（编辑态也生效，回调内先 EndEdit 提交当前编辑）
-            if ((keyData & Keys.Control) == Keys.Control && key == Keys.J)
-            {
-                GoToGraphicCommand?.Invoke();
-                return true;
-            }
             if ((keyData & Keys.Control) == Keys.Control
                 && !(IsGridEditing?.Invoke() ?? false)
                 && (key == Keys.C || key == Keys.X || key == Keys.V))
@@ -2482,6 +2562,23 @@ public class TextBatchEditForm : Form
         protected override void WndProc(ref Message m)
         {
             const int WM_PASTE = 0x0302;
+            const int WM_KEYDOWN = 0x0100;
+            const int WM_IME_KEYDOWN = 0x0290;
+
+            // 编辑态 Ctrl+J 兜底：直接在编辑控件窗口过程识别（含中文 IME 的 WM_IME_KEYDOWN）。
+            // 若应用层 CtrlJFilter 已吞掉则到不了这里；此分支专治宿主绕过 .NET 消息泵的情况。
+            if ((m.Msg == WM_KEYDOWN || m.Msg == WM_IME_KEYDOWN)
+                && m.WParam.ToInt32() == 'J'
+                && (Control.ModifierKeys & Keys.Control) != 0
+                && (Control.ModifierKeys & Keys.Alt) == 0)
+            {
+                if (EditingControlDataGridView?.FindForm() is TextBatchEditForm f)
+                {
+                    f.BeginInvoke((Action)f.GoToGraphicFromShortcut); // 异步执行，避免在 WndProc 里打开页造成重入
+                    return;
+                }
+            }
+
             if (m.Msg == WM_PASTE && Clipboard.ContainsText())
             {
                 var raw = Clipboard.GetText();
