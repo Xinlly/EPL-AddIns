@@ -137,21 +137,34 @@ public class TextBatchEditAction : IEplAction
         return selection.Length > 0 && !selection.Any(o => o is Placement);
     }
 
-    /// <summary>右键菜单显隐共用：当前上下文是否真有可编辑内容（选中文本，或页树显式选中页）。</summary>
-    public static bool SelectionCanEditText()
+    /// <summary>图纸（图形编辑器）右键显隐用：当前选择集是否包含文本对象（TextBase）。
+    /// 严格只认文本——图面只是打开页、未选中任何文本时返回 false，绝不因“当前页”而放行。</summary>
+    public static bool SelectionHasText()
     {
         try
         {
-            var ss = new SelectionSet();
-            var sel = ss.Selection ?? Array.Empty<StorableObject>();
-            if (sel.Any(o => o is TextBase)) { return true; }
-            if (sel.Length == 0) { return false; } // 图面仅打开页、未选中
-            var pages = ss.GetSelectedPages() ?? Array.Empty<Page>();
-            return IsExplicitPageSelection(sel, pages);
+            var sel = new SelectionSet().Selection;
+            return sel != null && sel.Any(o => o is TextBase);
         }
         catch (Exception ex)
         {
-            AddInLogger.Debug("SelectionCanEditText 判定异常：" + ex.Message);
+            AddInLogger.Debug("SelectionHasText 判定异常：" + ex.Message);
+            return false;
+        }
+    }
+
+    /// <summary>页导航器右键显隐用：是否显式选中了页/结构节点（选节点时节点内页也算）。
+    /// 仅允许在“页树菜单”上下文调用；图面菜单不得用它（GetSelectedPages 会返回当前打开页）。</summary>
+    public static bool SelectionHasPage()
+    {
+        try
+        {
+            var pages = new SelectionSet().GetSelectedPages();
+            return pages != null && pages.Length > 0;
+        }
+        catch (Exception ex)
+        {
+            AddInLogger.Debug("SelectionHasPage 判定异常：" + ex.Message);
             return false;
         }
     }

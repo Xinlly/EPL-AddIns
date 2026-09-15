@@ -175,13 +175,19 @@ public class TextBatchEditAddIn : IEplAddIn
             string text = sb.ToString().Replace("&", "");
             if (len == 0 || text.IndexOf(CtxMenuText, StringComparison.Ordinal) < 0) { continue; }
 
-            // 同名项同时挂在图纸(Ged)与页导航器(页树)：任一上下文满足即可点。
-            // 统一按“真有可编辑内容”显隐：图面选中文本，或页树显式选中页。
-            // 图面只是打开着某页、什么都没选时不显示（避免幽灵当前页被当整页）。
-            bool enabled = TextBatchEditAction.SelectionCanEditText();
+            // 同名项挂在两处：图纸(Editor/Ged)与页导航器(PmPageObjectTreeDialog/1007)。
+            // 必须按“当前弹出的是哪个菜单”分别判定，不能用一个 OR 条件——
+            // 否则 GED 打开页时 GetSelectedPages() 返回的“当前页”会让图纸菜单在未选文本时也出现（退化根因）。
+            // 判据：GED 图形视图窗口类名为 GXWND（图形核心窗口），其右键菜单 owner 的父链含 GXWND；页树菜单不在该链上。
+            bool isGedMenu = IsGedContext(hwnd);
+            bool enabled = isGedMenu
+                ? TextBatchEditAction.SelectionHasText()   // 图纸：严格只认选中的文本对象
+                : TextBatchEditAction.SelectionHasPage(); // 页导航器：选中页/结构节点
+            AddInLogger.Info("右键菜单：来源=" + (isGedMenu ? "图纸(GXWND)" : "页导航器")
+                + " 可编辑=" + enabled + " ownerClassChain=" + OwnerClassChain(hwnd) + " pos=" + i);
             if (enabled)
             {
-                AddInLogger.Info("右键菜单：选择满足条件（文本或页），保留项 pos=" + i + "（菜单项数=" + count + "）");
+                AddInLogger.Info("右键菜单：保留项 pos=" + i + "（菜单项数=" + count + "）");
             }
             else
             {
@@ -193,6 +199,53 @@ public class TextBatchEditAddIn : IEplAddIn
             }
             return;
         }
+    }
+
+    /// <summary>
+    /// 判断弹出菜单是否来自图形编辑器（图纸）。图形视图核心窗口类名为 GXWND，
+    /// TrackPopupMenu 的 owner 通常就是该视图或其 MFC 祖先——沿父链查 GXWND 即可与页导航器菜单区分。
+    /// </summary>
+    private static bool IsGedContext(IntPtr hwnd)
+    {
+        try
+        {
+            var cur = hwnd;
+            for (int depth = 0; cur != IntPtr.Zero && depth < 16; depth++)
+            {
+                if (GetClass(cur) == "GXWND") { return true; }
+                cur = NativeMethods.GetParent(cur);
+            }
+        }
+        catch (Exception ex)
+        {
+            AddInLogger.Debug("IsGedContext 判定异常：" + ex.Message);
+        }
+        return false;
+    }
+
+    /// <summary>记录菜单 owner 到顶层的类名链，供首次实机核对 GXWND 判定是否准确（只读、不影响逻辑）。</summary>
+    private static string OwnerClassChain(IntPtr hwnd)
+    {
+        try
+        {
+            var parts = new System.Collections.Generic.List<string>();
+            var cur = hwnd;
+            for (int depth = 0; cur != IntPtr.Zero && depth < 16; depth++)
+            {
+                parts.Add(GetClass(cur));
+                var p = NativeMethods.GetParent(cur);
+                if (p == cur) { break; }
+                cur = p;
+            }
+            return string.Join(" < ", parts);
+        }
+        catch { return "(类名链读取失败)"; }
+    }
+
+    private static string GetClass(IntPtr hWnd)
+    {
+        var sb = new StringBuilder(128);
+        return NativeMethods.GetClassNameW(hWnd, sb, sb.Capacity) > 0 ? sb.ToString() : string.Empty;
     }
 
     /// <summary>
@@ -250,6 +303,10 @@ public class TextBatchEditAddIn : IEplAddIn
         public static extern int GetMenuStringW(IntPtr hMenu, uint uIDItem, StringBuilder lpString, uint nMaxCount, uint uFlag);
         [DllImport("user32.dll", SetLastError = true)]
         public static extern bool DeleteMenu(IntPtr hMenu, uint uPosition, uint uFlags);
+
+        [DllImport("user32.dll")] public static extern IntPtr GetParent(IntPtr hWnd);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        public static extern int GetClassNameW(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);
 
         [StructLayout(LayoutKind.Sequential)]
         public struct CWPSTRUCT
