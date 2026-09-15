@@ -314,14 +314,9 @@ public class TextBatchEditForm : Form
             var g = _form._grid;
             if (g is not { IsHandleCreated: true }) { return false; }
             var focused = Control.FromHandle(m.HWnd);
-            var inGrid = focused != null && IsInGrid(focused, g);
-            // 受控诊断：仅在按下 Ctrl+J 时记录一条，便于实机判断消息是否到达 .NET 泵、焦点落在哪个控件
-            AddInLogger.Debug("Ctrl+J 过滤器：msg=0x" + m.Msg.ToString("X3")
-                + " 目标控件=" + (focused == null ? "null" : focused.GetType().Name)
-                + " 在表格内=" + inGrid);
-            if (!inGrid) { return false; }
+            if (focused == null || !IsInGrid(focused, g)) { return false; }
 
-            _form.GoToGraphicFromShortcut();
+            _form.GoToGraphicFromShortcut("应用消息过滤器");
             return true; // 吞掉，宿主与 grid 都不再收到
         }
 
@@ -452,6 +447,7 @@ public class TextBatchEditForm : Form
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(MakeMenuItem("调整列宽", null, (_, _) => AutoFitColumns()));
         menu.Items.Add(MakeMenuItem("调整行高", null, (_, _) => ResetRowHeights()));
+        ApplyMenuStyle(menu);
         _grid.ContextMenuStrip = menu;
 
         _grid.KeyDown += GridOnKeyDown;
@@ -491,6 +487,7 @@ public class TextBatchEditForm : Form
         };
         _grid.IsGridEditing = IsEditing;
         _grid.ZoomGrid = ZoomGrid;
+        _grid.GoToGraphicCommand = () => GoToGraphicFromShortcut("网格WndProc");
         _grid.CellFormatting += GridOnCellFormatting; // 统一单元格状态着色
         _grid.CurrentCellChanged += (_, _) =>
         {
@@ -528,6 +525,62 @@ public class TextBatchEditForm : Form
         return item;
     }
 
+    /// <summary>统一右键菜单外观：交给 ShortcutMenuRenderer 把快捷键贴到距右缘固定 10px。保留左侧图标列以备将来加图标。</summary>
+    private static void ApplyMenuStyle(ContextMenuStrip menu)
+    {
+        menu.Renderer = new ShortcutMenuRenderer();
+    }
+
+    /// <summary>
+    /// 自绘菜单项文字：功能名左对齐，快捷键右对齐且距菜单右缘固定 10px（默认渲染器此处留白过大）。
+    /// 关键：ToolStripMenuItem 对“主文本”和“快捷键”会分别调用一次 OnRenderItemText，
+    /// 必须用 e.Text 区分（主文本=e.Text==mi.Text；快捷键=e.Text==ShortcutKeyDisplayString），否则快捷键会被画两次而与主文字重叠。
+    /// 只接管文字绘制，背景/悬浮高亮/分隔条/图标列仍走系统 Professional 渲染。
+    /// </summary>
+    private sealed class ShortcutMenuRenderer : ToolStripProfessionalRenderer
+    {
+        private const int LeftPad = 8;   // 功能名距内容区左边界
+        private const int RightPad = 10; // 快捷键距菜单右边界
+        private const int MiddleGap = 16; // 功能名与快捷键之间的最小间隔
+
+        protected override void OnRenderItemText(ToolStripItemTextRenderEventArgs e)
+        {
+            if (e.Item is not ToolStripMenuItem mi || string.IsNullOrEmpty(e.Text))
+            {
+                base.OnRenderItemText(e);
+                return;
+            }
+
+            var shortcut = mi.ShortcutKeyDisplayString;
+            var isShortcutCall = !string.IsNullOrEmpty(shortcut) && e.Text == shortcut && e.Text != mi.Text;
+            var color = mi.Enabled ? e.TextColor : SystemColors.GrayText;
+            var r = mi.ContentRectangle;
+
+            if (isShortcutCall)
+            {
+                // 快捷键：量宽后右对齐到距右缘 RightPad
+                var sz = TextRenderer.MeasureText(e.Graphics, shortcut, e.TextFont ?? mi.Font);
+                var x = r.Right - RightPad - sz.Width;
+                var box = new System.Drawing.Rectangle(x, r.Top, sz.Width, r.Height);
+                TextRenderer.DrawText(e.Graphics, shortcut, e.TextFont ?? mi.Font, box, color,
+                    TextFormatFlags.VerticalCenter | TextFormatFlags.Right | TextFormatFlags.SingleLine | TextFormatFlags.NoPadding);
+                return;
+            }
+
+            // 主文本：左对齐；若有快捷键，右侧给快捷键留出空间
+            var rightLimit = r.Right - RightPad;
+            if (!string.IsNullOrEmpty(shortcut))
+            {
+                var scW = TextRenderer.MeasureText(e.Graphics, shortcut, e.TextFont ?? mi.Font).Width;
+                rightLimit = r.Right - RightPad - scW - MiddleGap;
+            }
+            var main = new System.Drawing.Rectangle(r.Left + LeftPad, r.Top, rightLimit - (r.Left + LeftPad), r.Height);
+            TextRenderer.DrawText(e.Graphics, e.Text, e.TextFont ?? mi.Font, main, color,
+                TextFormatFlags.VerticalCenter | TextFormatFlags.Left | TextFormatFlags.EndEllipsis
+                | TextFormatFlags.SingleLine | TextFormatFlags.NoPadding);
+        }
+    }
+
     /// <summary>单元格编辑态右键菜单：承载焦点的是内嵌文本框，作用于框内选区；风格与主菜单一致。</summary>
     private ContextMenuStrip BuildEditMenu(TextBox tb)
     {
@@ -547,7 +600,12 @@ public class TextBatchEditForm : Form
         m.Items.Add(MakeMenuItem("全选", "Ctrl+A", (_, _) => tb.SelectAll()));
         m.Items.Add(new ToolStripSeparator());
         m.Items.Add(MakeMenuItem("换行", "Ctrl+Enter", (_, _) => TryInsertLineBreakAtEditing()));
-        m.Items.Add(MakeMenuItem("转到图形", "Ctrl+J", (_, _) => GoToGraphicFromShortcut()));
+        m.Items.Add(MakeMenuItem("转到图形", "Ctrl+J", (_, _) =>
+        {
+            if (_grid.IsCurrentCellInEditMode) { _grid.EndEdit(); }
+            GoToGraphic("编辑态右键菜单");
+        }));
+        ApplyMenuStyle(m);
         return m;
     }
 
@@ -917,15 +975,18 @@ public class TextBatchEditForm : Form
         _grid[_newTextCol, row].ReadOnly = false;
     }
 
-    // —— Ctrl+J 快捷键入口：先提交在途编辑再转到图形（右键菜单直接走 GoToGraphic）——
-    private void GoToGraphicFromShortcut()
+    // —— Ctrl+J 快捷键入口：捕获瞬间先打点（证明快捷键被接收），再提交在途编辑并转到图形 ——
+    // layer 标识实际捕获层：网格WndProc / 编辑框WndProc / 应用消息过滤器，便于实机判断走的哪条通路。
+    private void GoToGraphicFromShortcut(string layer)
     {
-        if (_grid.IsCurrentCellInEditMode) { _grid.EndEdit(); }
-        GoToGraphic();
+        var editing = _grid.IsCurrentCellInEditMode;
+        AddInLogger.Info("快捷键 Ctrl+J 已捕获（捕获层=" + layer + "，编辑态=" + editing + "）");
+        if (editing) { _grid.EndEdit(); }
+        GoToGraphic("快捷键Ctrl+J/" + layer);
     }
 
-    // —— 右键菜单“转到图形”：打开选中行对象所在页，并在图形编辑器中选中该对象 ——
-    private void GoToGraphic()
+    // —— “转到图形”：打开选中行对象所在页，并在图形编辑器中选中该对象。source 用于区分右键/快捷键及捕获层 ——
+    private void GoToGraphic(string source = "右键菜单")
     {
         // 显示行 i 恒对应 _texts[i]（排序时 ApplySort 已同步重排）；右键前 CellMouseDown 已校正选区
         var rows = _grid.SelectedCells.Cast<DataGridViewCell>()
@@ -936,6 +997,7 @@ public class TextBatchEditForm : Form
             .ToList();
         if (rows.Count == 0)
         {
+            AddInLogger.Info("转到图形取消[来源=" + source + "]：未选中任何行");
             MessageBox.Show("请先选中至少一行文本。", "转到图形",
                 MessageBoxButtons.OK, MessageBoxIcon.Information);
             return;
@@ -947,11 +1009,11 @@ public class TextBatchEditForm : Form
             using var edit = new Eplan.EplApi.HEServices.Edit();
             // 官方语义：打开该 Placement 所在页，并在图形编辑器中选中它（TextBase 是 Placement 的派生类）。
             edit.OpenPageWithPlacement(t);
-            AddInLogger.Info("转到图形：行=" + (rows[0] + 1) + " 对象ID=" + t.DatabaseIdentifier);
+            AddInLogger.Info("转到图形[来源=" + source + "] 行=" + (rows[0] + 1) + " 对象ID=" + t.DatabaseIdentifier);
         }
         catch (Exception ex)
         {
-            AddInLogger.Error("转到图形失败", ex);
+            AddInLogger.Error("转到图形失败[来源=" + source + "]", ex);
             MessageBox.Show("转到图形失败：" + ex.Message, "转到图形",
                 MessageBoxButtons.OK, MessageBoxIcon.Warning);
         }
@@ -2469,6 +2531,25 @@ public class TextBatchEditForm : Form
         public Action<Keys>? GridClipboardCommand;
         public Func<bool>? IsGridEditing;
         public Action<bool>? ZoomGrid; // 参数：true=放大，false=缩小
+        public Action? GoToGraphicCommand; // 非编辑态 Ctrl+J（由本控件 WndProc 触发）
+
+        // 非编辑态 Ctrl+J：直接在网格自身窗口过程识别，含中文 IME 的 WM_IME_KEYDOWN。
+        // 这是本宿主里唯一被实测可靠的层（消息直达 HWND，不依赖 ProcessCmdKey / IMessageFilter）。
+        protected override void WndProc(ref Message m)
+        {
+            const int WM_KEYDOWN = 0x0100;
+            const int WM_IME_KEYDOWN = 0x0290;
+            if ((m.Msg == WM_KEYDOWN || m.Msg == WM_IME_KEYDOWN)
+                && m.WParam.ToInt32() == 'J'
+                && (Control.ModifierKeys & Keys.Control) != 0
+                && (Control.ModifierKeys & Keys.Alt) == 0
+                && GoToGraphicCommand != null)
+            {
+                BeginInvoke(GoToGraphicCommand); // 异步执行，避免在 WndProc 里打开页造成重入
+                return; // 吞掉该按键
+            }
+            base.WndProc(ref m);
+        }
 
         protected override void OnMouseWheel(MouseEventArgs e)
         {
@@ -2574,7 +2655,7 @@ public class TextBatchEditForm : Form
             {
                 if (EditingControlDataGridView?.FindForm() is TextBatchEditForm f)
                 {
-                    f.BeginInvoke((Action)f.GoToGraphicFromShortcut); // 异步执行，避免在 WndProc 里打开页造成重入
+                    f.BeginInvoke((Action)(() => f.GoToGraphicFromShortcut("编辑框WndProc"))); // 异步执行，避免在 WndProc 里打开页造成重入
                     return;
                 }
             }
