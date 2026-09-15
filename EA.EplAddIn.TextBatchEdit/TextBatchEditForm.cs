@@ -398,6 +398,7 @@ public class TextBatchEditForm : Form
         menu.Items.Add("还原选中的行(&R)", null, (_, _) => RestoreSelectedRows());
         menu.Items.Add("还原当前值(&V)", null, (_, _) => RestoreCurrentValue());
         menu.Items.Add("换行(&L)", null, (_, _) => InsertLineBreakIntoCurrent()); // 快捷键不可用时的兜底入口
+        menu.Items.Add("转到图形(&G)", null, (_, _) => GoToGraphic());             // 打开对象所在页并在图形编辑器中选中它
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add("调整列宽(&A)", null, (_, _) => AutoFitColumns());
         menu.Items.Add("调整行高(&H)", null, (_, _) => ResetRowHeights());
@@ -827,6 +828,39 @@ public class TextBatchEditForm : Form
         }
         // 文本列（单语言内容）始终可编辑
         _grid[_newTextCol, row].ReadOnly = false;
+    }
+
+    // —— 右键菜单“转到图形”：打开选中行对象所在页，并在图形编辑器中选中该对象 ——
+    private void GoToGraphic()
+    {
+        // 显示行 i 恒对应 _texts[i]（排序时 ApplySort 已同步重排）；右键前 CellMouseDown 已校正选区
+        var rows = _grid.SelectedCells.Cast<DataGridViewCell>()
+            .Where(c => c.RowIndex >= 0 && c.RowIndex < _texts.Count)
+            .Select(c => c.RowIndex)
+            .Distinct()
+            .OrderBy(r => r)
+            .ToList();
+        if (rows.Count == 0)
+        {
+            MessageBox.Show("请先选中至少一行文本。", "转到图形",
+                MessageBoxButtons.OK, MessageBoxIcon.Information);
+            return;
+        }
+
+        var t = _texts[rows[0]];
+        try
+        {
+            using var edit = new Eplan.EplApi.HEServices.Edit();
+            // 官方语义：打开该 Placement 所在页，并在图形编辑器中选中它（TextBase 是 Placement 的派生类）。
+            edit.OpenPageWithPlacement(t);
+            AddInLogger.Info("转到图形：行=" + (rows[0] + 1) + " 对象ID=" + t.DatabaseIdentifier);
+        }
+        catch (Exception ex)
+        {
+            AddInLogger.Error("转到图形失败", ex);
+            MessageBox.Show("转到图形失败：" + ex.Message, "转到图形",
+                MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
     }
 
     // —— 右键菜单“换行”：快捷键不可用时的兜底入口 ——
