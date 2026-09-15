@@ -40,6 +40,8 @@ public class TextBatchEditForm : Form
     private EditGrid _grid = null!;
     private CheckBox _showOrigChk = null!;
     private CheckBox _showSrcChk = null!;
+    private CheckBox _showStructChk = null!;
+    private CheckBox _showCoordChk = null!;
     private CheckBox _autoSaveChk = null!;
     private CheckBox _focusCellChk = null!;
     private Label _statusLabel = null!;
@@ -108,6 +110,7 @@ public class TextBatchEditForm : Form
         public string Plant = string.Empty;   // 高层代号显示值
         public string Place = string.Empty;   // 安装地点显示值
         public string Location = string.Empty;// 位置代号显示值
+        public string PageName = string.Empty;// 完整页名
         public double X;
         public double Y;
         // 三段结构标识符在“结构标识符管理”中的顺序序号（越小越靠前；未匹配取 double.MaxValue）
@@ -118,18 +121,19 @@ public class TextBatchEditForm : Form
 
     private const int ColIndex = 0;
     private const int ColType = 1;
-    // —— 只读结构/坐标信息列（位于“类型”右侧）——
+    // —— 只读结构/坐标信息列（默认隐藏，由“显示结构/显示坐标”开关控制）——
     private const int ColPlant = 2;        // 高层代号 =
     private const int ColPlace = 3;        // 安装地点 ++
     private const int ColLocation = 4;     // 位置代号 +
     private const int ColX = 5;            // X 坐标
     private const int ColY = 6;            // Y 坐标
+    private const int ColPage = 7;         // 页名（常显，仅纯页名）
 
-    private const int ColOrigMultilang = 7;   // 原值·多语言（只读复选框）
-    private const int ColOrigNoAuto = 8;      // 原值·不自动翻译（只读复选框）
-    private const int OrigTextCol = 9;        // 原值·文本列
+    private const int ColOrigMultilang = 8;   // 原值·多语言（只读复选框）
+    private const int ColOrigNoAuto = 9;      // 原值·不自动翻译（只读复选框）
+    private const int OrigTextCol = 10;       // 原值·文本列
 
-    private const int OrigLangStart = 10;     // 原值·语言列起点
+    private const int OrigLangStart = 11;     // 原值·语言列起点
     private int NewCheckStart => OrigLangStart + _projectLangs.Count;       // 新值复选框起点
     private int ColMultilang => NewCheckStart;      // 新值·多语言（可编辑）
     private int ColNoAutoTrans => NewCheckStart + 1; // 新值·不自动翻译（可编辑）
@@ -478,12 +482,14 @@ public class TextBatchEditForm : Form
         _grid.Columns[ColType].ReadOnly = true;
         _grid.Columns[ColType].SortMode = DataGridViewColumnSortMode.NotSortable;
 
-        // —— 只读结构/坐标信息列（类型右侧）——
-        AddInfoColumn("plant", "高层代号\n=", ColPlant, 90);
-        AddInfoColumn("place", "安装地点\n++", ColPlace, 90);
-        AddInfoColumn("location", "位置代号\n+", ColLocation, 90);
-        AddInfoColumn("x", "x", ColX, 60);
-        AddInfoColumn("y", "y", ColY, 60);
+        // —— 只读结构/坐标信息列（默认隐藏，由“显示结构/显示坐标”开关控制）——
+        AddInfoColumn("plant", "高层代号\n=", ColPlant, 90, visible: false);
+        AddInfoColumn("place", "安装地点\n++", ColPlace, 90, visible: false);
+        AddInfoColumn("location", "位置代号\n+", ColLocation, 90, visible: false);
+        AddInfoColumn("x", "x", ColX, 60, visible: false);
+        AddInfoColumn("y", "y", ColY, 60, visible: false);
+        // 页名：常显，只放纯页名（不含结构段），位置在 Y 轴右侧
+        AddInfoColumn("page", "页", ColPage, 110);
 
         // —— 原值侧（只读，默认随“显示原值”整体隐藏）——
         _grid.Columns.Add(new DataGridViewCheckBoxColumn { Name = "orig_multilang", HeaderText = "原值\n多语言", Width = 70, ReadOnly = true, Visible = false });
@@ -585,6 +591,12 @@ public class TextBatchEditForm : Form
         _showSrcChk = MakeToggle("显示源语言", 108, false); // 默认不显示源语言列
         _showSrcChk.CheckedChanged += (_, _) => UpdateColumnVisibility();
 
+        _showStructChk = MakeToggle("显示结构", 96, false);  // 默认不显示高层/安装/位置列
+        _showStructChk.CheckedChanged += (_, _) => UpdateColumnVisibility();
+
+        _showCoordChk = MakeToggle("显示坐标", 96, false);   // 默认不显示 X/Y 列
+        _showCoordChk.CheckedChanged += (_, _) => UpdateColumnVisibility();
+
         _autoSaveChk = MakeToggle("自动保存", 96, true);     // 默认开启：编辑结束即写回
         _autoSaveChk.CheckedChanged += (_, _) => OnAutoSaveToggled();
 
@@ -594,6 +606,8 @@ public class TextBatchEditForm : Form
         barFlow.Controls.Add(_autoSaveChk);   // 自动保存固定在所有开关最左
         barFlow.Controls.Add(_showOrigChk);
         barFlow.Controls.Add(_showSrcChk);
+        barFlow.Controls.Add(_showStructChk);
+        barFlow.Controls.Add(_showCoordChk);
         barFlow.Controls.Add(_focusCellChk);
         bar.Controls.Add(barFlow);
 
@@ -620,14 +634,17 @@ public class TextBatchEditForm : Form
                 "【上方开关】\n" +
                 "  • 显示原值：在左侧展开灰色的“原…”列，方便对照修改前的内容。\n" +
                 "  • 显示源语言：显示/隐藏源语言那一列（原值侧与新值侧各一列）；默认不显示。\n" +
+                "  • 显示结构：显示/隐藏高层代号(=)、安装地点(++)、位置代号(+)三列；默认不显示。\n" +
+                "  • 显示坐标：显示/隐藏 X、Y 两列；默认不显示。\n" +
                 "  • 自动保存：开启后编辑停顿即自动写回；关闭后需手动“应用”。默认开启。\n" +
                 "  • 单元格聚焦：开启后当前格所在的整行、整列（不含当前格本身）置极浅底色，方便对齐查看。默认开启。\n\n" +
                 "【换选中文本 / 多页】\n" +
                 "  • 窗口常开时重新框选文本、或在页导航器改选页，再执行命令即可刷新表格；\n" +
                 "  • 除图面框选外，也可在页导航器选中一个或多个页（或高层代号等节点）批量编辑这些页的全部文本；\n" +
                 "  • 若有未保存修改会先弹窗（保存并刷新/放弃刷新/取消）。\n\n" +
-                "【结构/坐标只读列】\n" +
-                "  • 最左行首列为行号（随当前显示位置变），其后“序号”列是默认排序下的固定编号；类型右侧为只读信息：高层代号(=)、安装地点(++)、位置代号(+)、X、Y。\n" +
+                "【结构/坐标/页只读列】\n" +
+                "  • 最左行首列为行号（随当前显示位置变），其后“序号”列是默认排序下的固定编号；类型右侧默认只显示“页”列（纯页名，不含结构段，常显）。\n" +
+                "  • 顶部“显示结构/显示坐标”开关可展开：高层代号(=)、安装地点(++)、位置代号(+)，以及 X、Y；两者默认关闭。\n" +
                 "  • 结构信息取自文本所在页；默认按“结构标识符管理”里的顺序，再按 X 从小到大、Y 从大到小。\n" +
                 "  • 灰色只读列仅显示，不能修改。\n\n" +
                 "【换行与排版】\n" +
@@ -663,8 +680,8 @@ public class TextBatchEditForm : Form
         Controls.Add(tabs);
     }
 
-    /// <summary>新增一个只读结构/坐标信息列：不可排序、灰底；坐标列右对齐。</summary>
-    private void AddInfoColumn(string name, string header, int index, int width)
+    /// <summary>新增一个只读结构/坐标信息列：不可排序、灰底；坐标列右对齐。默认可见，可指定初始隐藏。</summary>
+    private void AddInfoColumn(string name, string header, int index, int width, bool visible = true)
     {
         var col = new DataGridViewTextBoxColumn
         {
@@ -672,6 +689,7 @@ public class TextBatchEditForm : Form
             HeaderText = header,
             Width = width,
             ReadOnly = true,
+            Visible = visible,
             SortMode = DataGridViewColumnSortMode.NotSortable, // 双击排序由本类统一处理，箭头自绘
             DefaultCellStyle = new DataGridViewCellStyle
             {
@@ -695,9 +713,18 @@ public class TextBatchEditForm : Form
     {
         var showOrig = _showOrigChk.Checked;
         var showSrc = _showSrcChk.Checked;
+        var showStruct = _showStructChk.Checked;
+        var showCoord = _showCoordChk.Checked;
 
         // 若正编辑的列即将被隐藏，先提交编辑，避免 DataGridView 因 CurrentCell 落到隐藏列报错
         if (_grid.IsCurrentCellInEditMode) { _grid.EndEdit(); }
+
+        // 结构/坐标只读信息列：分别由“显示结构/显示坐标”控制；“页”列常显
+        _grid.Columns[ColPlant].Visible = showStruct;
+        _grid.Columns[ColPlace].Visible = showStruct;
+        _grid.Columns[ColLocation].Visible = showStruct;
+        _grid.Columns[ColX].Visible = showCoord;
+        _grid.Columns[ColY].Visible = showCoord;
 
         // 原值侧复选框、各原语言列：只看“显示原值”
         _grid.Columns[ColOrigMultilang].Visible = showOrig;
@@ -1126,12 +1153,16 @@ public class TextBatchEditForm : Form
             var page = t.Page;
             if (page != null)
             {
+                // “页”列只放纯页名：从完整页名（=高层+位置/页号）按最后一个 '/' 去掉结构段。
+                // 与导航器可见的完整页名严格同源；PAGE_NAME(#11000) 是默认可空的描述性名称，不能用它。
+                m.PageName = ExtractPageName(page.Name);
                 var pp = page.Properties;
                 // 用“完整/已解析”属性：继承上级页、含子结构的实际标识；未展开段 DESIGNATION_PLANT 可能为空。
                 m.Plant = PageIdent(pp.DESIGNATION_FULLPLANT);
                 m.Place = PageIdent(pp.DESIGNATION_FULLPLACEOFINSTALLATION);
                 m.Location = PageIdent(pp.DESIGNATION_FULLLOCATION);
-                AddInLogger.Debug("页结构 页=" + page.Name
+                AddInLogger.Debug("页结构 完整页名=" + (page.Name ?? string.Empty)
+                    + " 纯页名=[" + m.PageName + "]"
                     + " 高层=[" + m.Plant + "] 安装=[" + m.Place + "] 位置=[" + m.Location + "]");
             }
         }
@@ -1162,6 +1193,18 @@ public class TextBatchEditForm : Form
         if (v == null || v.IsEmpty) { return string.Empty; }
         var s = v.ToString();
         return s == null ? string.Empty : s.Trim();
+    }
+
+    /// <summary>
+    /// 从完整页名取纯页名：完整名形如“=高层+安装+位置/页号”，结构段与页号以最后一个 '/' 分隔。
+    /// 页号本身不含 '/'；无结构前缀（无 '/'）时整体即页名。null/空白返回空串。
+    /// </summary>
+    private static string ExtractPageName(string? fullName)
+    {
+        if (string.IsNullOrEmpty(fullName)) { return string.Empty; }
+        var s = fullName!.Trim();
+        var slash = s.LastIndexOf('/');
+        return slash >= 0 ? s.Substring(slash + 1).Trim() : s;
     }
 
     /// <summary>项目稳定标识（链接完整路径）；取不到时退化为 null。用于判断是否同一项目。</summary>
@@ -1316,6 +1359,7 @@ public class TextBatchEditForm : Form
 
                 // 只读结构/坐标信息（坐标排序用原始 double，显示保留 1 位小数）
                 var meta = BuildMeta(t);
+                row.Cells[ColPage].Value = meta.PageName;
                 row.Cells[ColPlant].Value = meta.Plant;
                 row.Cells[ColPlace].Value = meta.Place;
                 row.Cells[ColLocation].Value = meta.Location;
