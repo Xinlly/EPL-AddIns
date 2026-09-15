@@ -178,13 +178,16 @@ public class TextBatchEditAddIn : IEplAddIn
             // 同名项挂在两处：图纸(Editor/Ged)与页导航器(PmPageObjectTreeDialog/1007)。
             // 必须按“当前弹出的是哪个菜单”分别判定，不能用一个 OR 条件——
             // 否则 GED 打开页时 GetSelectedPages() 返回的“当前页”会让图纸菜单在未选文本时也出现（退化根因）。
-            // 判据：GED 图形视图窗口类名为 GXWND（图形核心窗口），其右键菜单 owner 的父链含 GXWND；页树菜单不在该链上。
-            bool isGedMenu = IsGedContext(hwnd);
+            // 判据（实测光标命中窗口链）：图面图形视图链含 MFC 文档视图类 AfxFrameOrView（…<MDIClient<AfxMDIFrame）；
+            // 页导航器是停靠对话框里的树（AfxWnd < #32770 < Afx:ControlBar…），不含 AfxFrameOrView。
+            // 注意：菜单 owner 被 MFC 路由到主框架，绝不能用 owner hwnd/类名判，只能用右键瞬间光标实际所在窗口。
+            string chain = CursorHitChain();
+            bool isGedMenu = chain.IndexOf("AfxFrameOrView", StringComparison.Ordinal) >= 0;
             bool enabled = isGedMenu
                 ? TextBatchEditAction.SelectionHasText()   // 图纸：严格只认选中的文本对象
                 : TextBatchEditAction.SelectionHasPage(); // 页导航器：选中页/结构节点
-            AddInLogger.Info("右键菜单：来源=" + (isGedMenu ? "图纸(GXWND)" : "页导航器")
-                + " 可编辑=" + enabled + " ownerClassChain=" + OwnerClassChain(hwnd) + " pos=" + i);
+            AddInLogger.Info("右键菜单：来源=" + (isGedMenu ? "图纸(AfxFrameOrView)" : "页导航器")
+                + " 可编辑=" + enabled + " cursorHitChain=" + chain + " pos=" + i);
             if (enabled)
             {
                 AddInLogger.Info("右键菜单：保留项 pos=" + i + "（菜单项数=" + count + "）");
@@ -202,44 +205,26 @@ public class TextBatchEditAddIn : IEplAddIn
     }
 
     /// <summary>
-    /// 判断弹出菜单是否来自图形编辑器（图纸）。图形视图核心窗口类名为 GXWND，
-    /// TrackPopupMenu 的 owner 通常就是该视图或其 MFC 祖先——沿父链查 GXWND 即可与页导航器菜单区分。
+    /// 返回右键弹出瞬间，光标实际所在窗口沿父链到顶层的类名序列（用 ' &lt; ' 连接）。
+    /// 这是区分图面/页树右键的可靠信号——GED 菜单的 WM_INITMENUPOPUP owner 被 MFC 路由到主框架，
+    /// 但光标仍停在被点击的真实表面（图面=AfxFrameOrView…MDIClient 链；页树=AfxWnd/#32770/Afx:ControlBar 链）。
     /// </summary>
-    private static bool IsGedContext(IntPtr hwnd)
+    private static string CursorHitChain()
     {
         try
         {
-            var cur = hwnd;
-            for (int depth = 0; cur != IntPtr.Zero && depth < 16; depth++)
-            {
-                if (GetClass(cur) == "GXWND") { return true; }
-                cur = NativeMethods.GetParent(cur);
-            }
-        }
-        catch (Exception ex)
-        {
-            AddInLogger.Debug("IsGedContext 判定异常：" + ex.Message);
-        }
-        return false;
-    }
-
-    /// <summary>记录菜单 owner 到顶层的类名链，供首次实机核对 GXWND 判定是否准确（只读、不影响逻辑）。</summary>
-    private static string OwnerClassChain(IntPtr hwnd)
-    {
-        try
-        {
+            NativeMethods.POINT pt;
+            if (!NativeMethods.GetCursorPos(out pt)) { return "(GetCursorPos fail)"; }
+            var hit = NativeMethods.WindowFromPoint(pt);
+            if (hit == IntPtr.Zero) { return "(no window at " + pt.X + "," + pt.Y + ")"; }
             var parts = new System.Collections.Generic.List<string>();
-            var cur = hwnd;
-            for (int depth = 0; cur != IntPtr.Zero && depth < 16; depth++)
+            for (var cur = hit; cur != IntPtr.Zero; cur = NativeMethods.GetParent(cur))
             {
                 parts.Add(GetClass(cur));
-                var p = NativeMethods.GetParent(cur);
-                if (p == cur) { break; }
-                cur = p;
             }
             return string.Join(" < ", parts);
         }
-        catch { return "(类名链读取失败)"; }
+        catch (Exception ex) { return "(chain fail: " + ex.GetType().Name + ")"; }
     }
 
     private static string GetClass(IntPtr hWnd)
@@ -249,10 +234,10 @@ public class TextBatchEditAddIn : IEplAddIn
     }
 
     /// <summary>
-    /// 判断待初始化的弹出菜单是否“主菜单栏的下拉”。两路信号任一命中即认定为主菜单（宁可漏隐藏右键项，
-    /// 也绝不误删主菜单入口）：
-    /// ① WM_INITMENUPOPUP 的所属窗口就是进程主框架窗口（主菜单下拉由主框架接收；右键菜单 owner 是编辑器/导航器窗口）；
-    /// ② 该 HMENU 挂在主框架顶层 HMENU 的子菜单树里（右键 TrackPopupMenu 是独立菜单，不在此树）。
+    /// 判断待初始化的弹出菜单是否“主菜单栏的下拉”。
+    /// 只能依据 HMENU 是否挂在主框架 GetMenu() 的菜单树里——绝不能用“hwnd==主框架”：
+    /// 实测 MFC 把图面(GED)右键菜单的 WM_INITMENUPOPUP 也路由到主框架窗口（hwnd 就是 AfxMDIFrame140u），
+    /// 用 hwnd 判等会把图面右键误当成主菜单下拉而放行，导致“未选文本仍出现菜单项”。
     /// </summary>
     private static bool IsMainFramePopup(IntPtr hMenu, IntPtr hwnd)
     {
@@ -260,10 +245,9 @@ public class TextBatchEditAddIn : IEplAddIn
         {
             var frame = Process.GetCurrentProcess().MainWindowHandle;
             if (frame == IntPtr.Zero) { return false; }
-            if (hwnd == frame) { return true; } // 信号①
             var root = NativeMethods.GetMenu(frame);
             if (root == IntPtr.Zero) { return false; }
-            return MenuTreeContains(root, hMenu, 0); // 信号②
+            return MenuTreeContains(root, hMenu, 0); // 右键 TrackPopupMenu 是独立菜单，不在此树
         }
         catch (Exception ex)
         {
@@ -307,6 +291,10 @@ public class TextBatchEditAddIn : IEplAddIn
         [DllImport("user32.dll")] public static extern IntPtr GetParent(IntPtr hWnd);
         [DllImport("user32.dll", CharSet = CharSet.Unicode)]
         public static extern int GetClassNameW(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);
+        [StructLayout(LayoutKind.Sequential)]
+        public struct POINT { public int X; public int Y; }
+        [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT pt);
+        [DllImport("user32.dll")] public static extern IntPtr WindowFromPoint(POINT pt);
 
         [StructLayout(LayoutKind.Sequential)]
         public struct CWPSTRUCT
