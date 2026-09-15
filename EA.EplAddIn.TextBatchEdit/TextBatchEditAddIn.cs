@@ -2,6 +2,7 @@ using Eplan.EplApi.ApplicationFramework;
 using Eplan.EplApi.Base;
 using Eplan.EplApi.Gui;
 using System;
+using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Windows.Forms;
@@ -43,7 +44,7 @@ public class TextBatchEditAddIn : IEplAddIn
     {
         AddInLogger.Info("OnInitGui: registering menus");
         new Eplan.EplApi.Gui.Menu().AddMenuItem(
-            "批量修改选中文本（中英文）", TextBatchEditAction.ActionName);
+            CtxMenuText, TextBatchEditAction.ActionName);
 
         // 图纸（图形编辑器）右键：Editor/Ged，菜单项常驻注册一次。
         // GED 右键不回调 IEplActionEnable、ContextMenu 也无置灰接口，且 EPLAN 是 MFC/BCG 消息循环
@@ -141,7 +142,7 @@ public class TextBatchEditAddIn : IEplAddIn
                 // 在窗口过程（BCG 的 OnInitMenuPopup）处理“之前”介入
                 if (s.message == WmInitMenuPopup || s.message == WmInitMenu)
                 {
-                    RemoveItemIfNeeded(s.wParam); // wParam = 待初始化菜单的 HMENU
+                    RemoveItemIfNeeded(s.wParam, s.hwnd); // wParam=待初始化菜单 HMENU，hwnd=菜单所属窗口
                 }
             }
         }
@@ -152,9 +153,17 @@ public class TextBatchEditAddIn : IEplAddIn
         return NativeMethods.CallNextHookEx(_hookHandle, nCode, wParam, lParam);
     }
 
-    private void RemoveItemIfNeeded(IntPtr hMenu)
+    private void RemoveItemIfNeeded(IntPtr hMenu, IntPtr hwnd)
     {
         if (hMenu == IntPtr.Zero) { return; }
+
+        // 统一菜单名后，主菜单项也叫“文本批量编辑”。必须区分主菜单栏下拉（常驻、不删）
+        // 与右键 TrackPopupMenu（按需删除）：所属窗口是主框架，或该 HMENU 挂在主框架菜单树里，即判为主菜单。
+        if (IsMainFramePopup(hMenu, hwnd))
+        {
+            return;
+        }
+
         int count = NativeMethods.GetMenuItemCount(hMenu);
         if (count <= 0) { return; }
 
@@ -186,6 +195,43 @@ public class TextBatchEditAddIn : IEplAddIn
         }
     }
 
+    /// <summary>
+    /// 判断待初始化的弹出菜单是否“主菜单栏的下拉”。两路信号任一命中即认定为主菜单（宁可漏隐藏右键项，
+    /// 也绝不误删主菜单入口）：
+    /// ① WM_INITMENUPOPUP 的所属窗口就是进程主框架窗口（主菜单下拉由主框架接收；右键菜单 owner 是编辑器/导航器窗口）；
+    /// ② 该 HMENU 挂在主框架顶层 HMENU 的子菜单树里（右键 TrackPopupMenu 是独立菜单，不在此树）。
+    /// </summary>
+    private static bool IsMainFramePopup(IntPtr hMenu, IntPtr hwnd)
+    {
+        try
+        {
+            var frame = Process.GetCurrentProcess().MainWindowHandle;
+            if (frame == IntPtr.Zero) { return false; }
+            if (hwnd == frame) { return true; } // 信号①
+            var root = NativeMethods.GetMenu(frame);
+            if (root == IntPtr.Zero) { return false; }
+            return MenuTreeContains(root, hMenu, 0); // 信号②
+        }
+        catch (Exception ex)
+        {
+            AddInLogger.Debug("IsMainFramePopup 判定异常，按非主菜单处理：" + ex.Message);
+            return false; // 判定失败时保守按右键菜单处理（维持原有按需删除行为）
+        }
+    }
+
+    private static bool MenuTreeContains(IntPtr parentMenu, IntPtr target, int depth)
+    {
+        if (parentMenu == target) { return true; }
+        if (depth > 8 || parentMenu == IntPtr.Zero) { return false; } // 菜单层级有限，防止异常递归
+        int count = NativeMethods.GetMenuItemCount(parentMenu);
+        for (int i = 0; i < count; i++)
+        {
+            var sub = NativeMethods.GetSubMenu(parentMenu, i);
+            if (sub != IntPtr.Zero && MenuTreeContains(sub, target, depth + 1)) { return true; }
+        }
+        return false;
+    }
+
     private static class NativeMethods
     {
         public delegate IntPtr CallWndProc(int nCode, IntPtr wParam, IntPtr lParam);
@@ -198,6 +244,8 @@ public class TextBatchEditAddIn : IEplAddIn
         [DllImport("user32.dll")]
         public static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
         [DllImport("user32.dll")] public static extern int GetMenuItemCount(IntPtr hMenu);
+        [DllImport("user32.dll")] public static extern IntPtr GetMenu(IntPtr hWnd);
+        [DllImport("user32.dll")] public static extern IntPtr GetSubMenu(IntPtr hMenu, int nPos);
         [DllImport("user32.dll", CharSet = CharSet.Unicode)]
         public static extern int GetMenuStringW(IntPtr hMenu, uint uIDItem, StringBuilder lpString, uint nMaxCount, uint uFlag);
         [DllImport("user32.dll", SetLastError = true)]

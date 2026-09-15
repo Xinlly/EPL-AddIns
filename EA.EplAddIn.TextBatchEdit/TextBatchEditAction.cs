@@ -160,7 +160,7 @@ public class TextBatchEditAction : IEplAction
             if (texts.Count == 0)
             {
                 MessageBox.Show("没有可编辑的文本。\n请在图形编辑器中框选文本，或在页导航器中选中一个/多个页后再执行。",
-                    "批量修改选中文本", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    "文本批量编辑", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 return true;
             }
 
@@ -206,7 +206,7 @@ public class TextBatchEditAction : IEplAction
         {
             AddInLogger.Error("Action Execute 未处理异常", ex);
             MessageBox.Show("执行失败：" + ex.Message + "\n\n详见日志。",
-                "批量修改选中文本", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                "文本批量编辑", MessageBoxButtons.OK, MessageBoxIcon.Error);
             return false;
         }
     }

@@ -27,7 +27,7 @@ EPL-AddIns/
 │   ├── HelloWorldAction.cs      # IEplAction 实现
 │   ├── TableEditorForm.cs       # WinForms 表格编辑窗口（DataGridView，界面演示）
 │   └── TableEditorAction.cs     # 打开表格窗口的 Action
-├── EA.EplAddIn.TextBatchEdit/   # 第二个 Add-in：批量修改选中文本的中英文
+├── EA.EplAddIn.TextBatchEdit/   # 第二个 Add-in：文本批量编辑（选中文本的中英文）
 │   ├── EA.EplAddIn.TextBatchEdit.csproj
 │   ├── TextBatchEditAddIn.cs    # IEplAddIn + 菜单
 │   ├── TextBatchEditAction.cs   # 取选择集筛 TextBase → 开窗 → 写回
