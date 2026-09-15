@@ -539,7 +539,6 @@ public class TextBatchEditForm : Form
     /// </summary>
     private sealed class ShortcutMenuRenderer : ToolStripProfessionalRenderer
     {
-        private const int LeftPad = 8;   // 功能名距内容区左边界
         private const int RightPad = 10; // 快捷键距菜单右边界
         private const int MiddleGap = 16; // 功能名与快捷键之间的最小间隔
 
@@ -555,27 +554,30 @@ public class TextBatchEditForm : Form
             var isShortcutCall = !string.IsNullOrEmpty(shortcut) && e.Text == shortcut && e.Text != mi.Text;
             var color = mi.Enabled ? e.TextColor : SystemColors.GrayText;
             var r = mi.ContentRectangle;
+            var font = e.TextFont ?? mi.Font;
 
             if (isShortcutCall)
             {
                 // 快捷键：量宽后右对齐到距右缘 RightPad
-                var sz = TextRenderer.MeasureText(e.Graphics, shortcut, e.TextFont ?? mi.Font);
+                var sz = TextRenderer.MeasureText(e.Graphics, shortcut, font);
                 var x = r.Right - RightPad - sz.Width;
                 var box = new System.Drawing.Rectangle(x, r.Top, sz.Width, r.Height);
-                TextRenderer.DrawText(e.Graphics, shortcut, e.TextFont ?? mi.Font, box, color,
+                TextRenderer.DrawText(e.Graphics, shortcut, font, box, color,
                     TextFormatFlags.VerticalCenter | TextFormatFlags.Right | TextFormatFlags.SingleLine | TextFormatFlags.NoPadding);
                 return;
             }
 
-            // 主文本：左对齐；若有快捷键，右侧给快捷键留出空间
+            // 主文本：左边界必须用 e.TextRectangle.Left（框架已越过图标列/勾选列），
+            // 不能用 ContentRectangle.Left——那是含图标列的最左缘，会让文字钻进图标列底下。
+            var left = e.TextRectangle.Left;
             var rightLimit = r.Right - RightPad;
             if (!string.IsNullOrEmpty(shortcut))
             {
-                var scW = TextRenderer.MeasureText(e.Graphics, shortcut, e.TextFont ?? mi.Font).Width;
+                var scW = TextRenderer.MeasureText(e.Graphics, shortcut, font).Width;
                 rightLimit = r.Right - RightPad - scW - MiddleGap;
             }
-            var main = new System.Drawing.Rectangle(r.Left + LeftPad, r.Top, rightLimit - (r.Left + LeftPad), r.Height);
-            TextRenderer.DrawText(e.Graphics, e.Text, e.TextFont ?? mi.Font, main, color,
+            var main = new System.Drawing.Rectangle(left, r.Top, rightLimit - left, r.Height);
+            TextRenderer.DrawText(e.Graphics, e.Text, font, main, color,
                 TextFormatFlags.VerticalCenter | TextFormatFlags.Left | TextFormatFlags.EndEllipsis
                 | TextFormatFlags.SingleLine | TextFormatFlags.NoPadding);
         }

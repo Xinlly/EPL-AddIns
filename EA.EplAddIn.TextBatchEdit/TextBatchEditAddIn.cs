@@ -176,9 +176,9 @@ public class TextBatchEditAddIn : IEplAddIn
             if (len == 0 || text.IndexOf(CtxMenuText, StringComparison.Ordinal) < 0) { continue; }
 
             // 同名项同时挂在图纸(Ged)与页导航器(页树)：任一上下文满足即可点。
-            // 图纸：选中文本；页树：选中页。两路在 Action 内自动区分。
-            bool enabled = TextBatchEditAction.SelectionHasText()
-                || TextBatchEditAction.SelectionHasPage();
+            // 统一按“真有可编辑内容”显隐：图面选中文本，或页树显式选中页。
+            // 图面只是打开着某页、什么都没选时不显示（避免幽灵当前页被当整页）。
+            bool enabled = TextBatchEditAction.SelectionCanEditText();
             if (enabled)
             {
                 AddInLogger.Info("右键菜单：选择满足条件（文本或页），保留项 pos=" + i + "（菜单项数=" + count + "）");
