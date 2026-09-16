@@ -94,6 +94,10 @@ dotnet build EPL-AddIns.slnx
   - `scripts/restart-eplan.ps1`：优雅关 EPLAN（WM_CLOSE=0x0010，等同点 X；标题栏 X 的后台点击对自绘标题栏是 no-op；无未保存修改时不弹保存框，若弹框脚本退出码 2 停止、不盲点）→ 启动 `Eplan.exe /Variant:"Electric P8"` → 轮询新进程的可见 `#32770` 许可窗 → PostMessage `WM_COMMAND IDOK(1)` 点掉。
   - **不要手动清 `%AppData%\EPLAN\ShadowCopyAssemblies\`**：EPLAN 重启时会按注册源 DLL 自动重新影子复制（xavier 2026-09-16 纠正，旧写法“先删目录”是多此一举）。
 - **验证加载版本用 `scripts/verify-addin-loaded.ps1`**：比对影子副本 DLL 与新构建的 **SHA-256**（不同构建字节数可能巧合相同，绝不能只看大小/时间）；辅以插件 OnInit 日志记录的程序集全名，或 EPLAN「API 模块（拼接软件）」对话框“装配名称”列的 Version。
+- **发键前的焦点/输入法三件套（通用 Win32，纯 ASCII）**：
+  - `scripts/set-input-language.ps1 -Lang 0409|0804`：用 `LoadKeyboardLayout`+`PostMessage(WM_INPUTLANGCHANGEREQUEST=0x0050)` 切换**前台窗口线程**输入语言并读回验证（单 LoadKeyboardLayout 只影响调用线程，必须发消息给目标窗）。发字母/快捷键前切 0409，测完切回 0804。
+  - `scripts/check-kbd-focus.ps1 [-ExpectPid N] [-ExpectFocusClass AfxFrameOrView] [-ExpectLangHex 0409]`：只读，打印**真实键盘焦点窗口类**（`GetGUIThreadInfo`，不是前台窗）+ 线程 HKL，断言不符退出码 1。
+  - `scripts/monitor-focus.ps1 -Pid N -Seconds 20 -OutFile f.txt`：后台采样焦点窗口类+HKL（变化才记）。运行前台 PS 会抢焦点，故后台跑它、期间用 cua-driver 操作，解决时序观察难题。
 - 注册源 DLL 唯一位置＝仓库 `EA.EplAddIn.TextBatchEdit\bin\Debug\net472\`（全盘无其他副本）；启动后自动重开上次项目。
 - **【IME 坑，反复踩】cua-driver 用 SendInput 发字母/快捷键前，必须先确保是英文输入法**：中文 IME 下字母键进输入法组合串、抢焦点，`Ctrl+A`/`Ctrl+J`/单字母快捷键(T 等)全到不了 EPLAN（症状：Ctrl+A 选中 0 个对象）。快捷键失效先怀疑 IME，别怀疑 EPLAN/插件；动作前先切 ENG（或发一次 Shift 切换）。
 - 精确定位窗口/控件用 Win32 枚举类名或 UIA（按 Name/ControlType），不要靠截图盲点坐标；行为判定优先读插件结构化日志。屏幕点击用 cua-driver 的 `capture_scope=desktop`+`delivery_mode=foreground`+真实像素并先 `bring_to_front`（窗口坐标在双屏/DPI 下会错位，双屏虚拟原点可能 (0,-1080)）；视觉模型对密集自绘菜单/选中态会看错，只能佐证不能单一定据。
@@ -184,6 +188,7 @@ new Decider().Decide(
 `new Menu().AddMenuItem("菜单文本", "ActionName")` —— 2 参数重载，追加到"实用工具/工具"菜单末尾，在 `OnInitGui` 中调用。
 右键菜单用 `ContextMenu` + `ContextMenuLocation`：
 - **图形编辑器（图纸页面对象）右键**：`DialogName="Editor"`、`ContextMenuName="Ged"`——两个属性分别赋值，**不能拼成 `"Editor.Ged"`**（实测可用，见 EPL-Scripts 的 ContextMenuHelloWorld）。注册：`new ContextMenu().AddMenuItem(loc, "菜单文本", "ActionName", separatorBefore, separatorBehind)`，在 `OnInitGui` 调用
+- **同一菜单项另挂两处**（共用同一 Action，钩子按右键瞬间光标窗口链区分表面）：页导航器 `DialogName="PmPageObjectTreeDialog"`、`ContextMenuName="1007"`；查找结果选项卡 `DialogName="XSeSearchResultsTab1"`、`ContextMenuName="1002"`（内部标识 `XSeSearchResultsDlg/Tab1/Tab3` 取自 `Bin\SearchAndReplaceGuiu.erx` 二进制；**注册是否生效、结果行是否进入 SelectionSet 待 EPLAN 实测**）。
 - 菜单项启用/隐藏：`IEplActionEnable.Enabled` **仅对主菜单/工具栏/Ribbon 生效；对 `Editor/Ged` 图形编辑器右键注入项 EPLAN 完全不回调（2.9 日志验证全程无调用）**，`ContextMenu` 也无置灰/隐藏属性。官方菜单项的置灰/隐藏由平台内部代码控制，未开放给第三方。第三方（DanielPa/Eplanwiki SwitchMacroVariant，同样挂 Editor/Ged）也只能常驻+点击时校验。
 - 试过且**被日志证伪**的动态时机：① 400ms 轮询（可行但被否决，性能/时序差）；② `new EventHandler("onActionEnd.String.*").NameEvent`——订阅成功，启动期有 selectionset/XGedOpenSchemePage 等内部事件，但**用户在图形编辑器里的点选/框选/右键一条 onActionEnd 都不发**（2.9 实测），不能用来跟踪选择。
 - ❌ **WinForms 消息过滤器也已实测证伪（2.9）**：物理右键确认落在 GED 画布（WindowFromPoint pid=EPLAN），右键确实弹出 MFC 菜单（出现 `Afx:...:800...` 弹出窗口类），但 `Application.AddMessageFilter` 全程零回调。根因：EPLAN 主界面是 **MFC/BCG 自己的消息循环（主窗口类 `AfxMDIFrame140u`），不是 WinForms `Application.Run`**，IMessageFilter 只在 WinForms 消息泵被查询，MFC 泵取消息时不经过它。
