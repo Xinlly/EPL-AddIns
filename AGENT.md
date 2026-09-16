@@ -82,7 +82,21 @@ dotnet build EPL-AddIns.slnx
 
 - **默认在代码修改完成后自动执行 `dotnet build` 验证编译通过**（2026-09-11 起的约定，无需等待指示）；用户明确说"先别编译"时例外。
 - 修改代码只动与需求直接相关的行，禁止整文件重写、顺手改格式/注释。
-- EPLAN 实际加载、注册、运行测试由用户在 Windows 的 EPLAN 中完成；助手无法启动 EPLAN，不得声称"已验证运行"。
+- **助手可以也应当用 cua-driver 在测试机自测 EPLAN**（2026-09-15 起用户明确授权：宿主机 EPLAN 就是测试用的，直接重启即可，不要在重启上畏缩、不要再说"跑不了 EPLAN"）。但没真正执行/没看到结果就不得声称"已验证"。
+
+### 重启 / 自测 EPLAN 的固定坑（必看，已反复踩过）
+
+- **每次启动 EPLAN 必弹「选择许可」对话框**（单机许可，许可文件 `C:\Users\Public\EPLAN\Common\*.EPL`；"选择模式=从不(一直显示选择)"导致每次都弹）。它是模态的，**不点掉它 EPLAN 主界面不会完成加载、add-in 也测不了**。
+  - 启动 `Eplan.exe /Variant:"Electric P8"` 后，必须等窗口标题为「选择许可」的对话框出现（pid 同 EPLAN，类 `#32770`），处理它，再等主窗口。
+  - 许可行 `EPLAN Electric P8. Professional` 默认已勾选高亮；该框底部「确定/取消」是 BCG 自绘、UIA 树里**不暴露为可 invoke 的 Button**。可靠做法：`press_key(key="return")`（后台 PostMessage 即可，焦点默认在确定）。下拉框旁那个 UIA 误标的"打开"不是确认键，别点。
+  - 启动后通常自动重开上次项目（标题形如 `EPLAN Electric P8 2.9 ... - <项目路径>`）。
+- **必须重启才能加载新 DLL**：add-in 载入 AppDomain 后锁定+影子复制，2.9 无热重载。固定循环已脚本化，**直接调用不要重写**：
+  - `scripts/restart-eplan.ps1`：优雅关 EPLAN（WM_CLOSE=0x0010，等同点 X；标题栏 X 的后台点击对自绘标题栏是 no-op；无未保存修改时不弹保存框，若弹框脚本退出码 2 停止、不盲点）→ 启动 `Eplan.exe /Variant:"Electric P8"` → 轮询新进程的可见 `#32770` 许可窗 → PostMessage `WM_COMMAND IDOK(1)` 点掉。
+  - **不要手动清 `%AppData%\EPLAN\ShadowCopyAssemblies\`**：EPLAN 重启时会按注册源 DLL 自动重新影子复制（xavier 2026-09-16 纠正，旧写法“先删目录”是多此一举）。
+- **验证加载版本用 `scripts/verify-addin-loaded.ps1`**：比对影子副本 DLL 与新构建的 **SHA-256**（不同构建字节数可能巧合相同，绝不能只看大小/时间）；辅以插件 OnInit 日志记录的程序集全名，或 EPLAN「API 模块（拼接软件）」对话框“装配名称”列的 Version。
+- 注册源 DLL 唯一位置＝仓库 `EA.EplAddIn.TextBatchEdit\bin\Debug\net472\`（全盘无其他副本）；启动后自动重开上次项目。
+- **【IME 坑，反复踩】cua-driver 用 SendInput 发字母/快捷键前，必须先确保是英文输入法**：中文 IME 下字母键进输入法组合串、抢焦点，`Ctrl+A`/`Ctrl+J`/单字母快捷键(T 等)全到不了 EPLAN（症状：Ctrl+A 选中 0 个对象）。快捷键失效先怀疑 IME，别怀疑 EPLAN/插件；动作前先切 ENG（或发一次 Shift 切换）。
+- 精确定位窗口/控件用 Win32 枚举类名或 UIA（按 Name/ControlType），不要靠截图盲点坐标；行为判定优先读插件结构化日志。屏幕点击用 cua-driver 的 `capture_scope=desktop`+`delivery_mode=foreground`+真实像素并先 `bring_to_front`（窗口坐标在双屏/DPI 下会错位，双屏虚拟原点可能 (0,-1080)）；视觉模型对密集自绘菜单/选中态会看错，只能佐证不能单一定据。
 
 ### 日志（AddInLogger）
 
