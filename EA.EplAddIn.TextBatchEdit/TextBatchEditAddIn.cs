@@ -78,6 +78,20 @@ public class TextBatchEditAddIn : IEplAddIn
             AddInLogger.Error("页导航器右键菜单：注册失败", ex);
         }
 
+        // 查找结果列表右键：XSeSearchResultsTab1 / 1002（“查找结果”选项卡，标识取自 SearchAndReplaceGui 模块）。
+        // 同名、同一 Action；结果行对象经 SelectionSet 进入——文本结果走“选中文本”，页结果走“选中页→整页”。
+        try
+        {
+            new EplContextMenu().AddMenuItem(
+                new ContextMenuLocation { DialogName = "XSeSearchResultsTab1", ContextMenuName = "1002" },
+                CtxMenuText, TextBatchEditAction.ActionName, false, true);
+            AddInLogger.Info("右键菜单：常驻项已注册 (XSeSearchResultsTab1/1002)");
+        }
+        catch (Exception ex)
+        {
+            AddInLogger.Error("查找结果右键菜单：注册失败", ex);
+        }
+
         InstallHook();
         return true;
     }
@@ -175,18 +189,19 @@ public class TextBatchEditAddIn : IEplAddIn
             string text = sb.ToString().Replace("&", "");
             if (len == 0 || text.IndexOf(CtxMenuText, StringComparison.Ordinal) < 0) { continue; }
 
-            // 同名项挂在两处：图纸(Editor/Ged)与页导航器(PmPageObjectTreeDialog/1007)。
+            // 同名项挂在三处：图纸(Editor/Ged)、页导航器(PmPageObjectTreeDialog/1007)、查找结果(XSeSearchResultsTab1/1002)。
             // 必须按“当前弹出的是哪个菜单”分别判定，不能用一个 OR 条件——
             // 否则 GED 打开页时 GetSelectedPages() 返回的“当前页”会让图纸菜单在未选文本时也出现（退化根因）。
             // 判据（实测光标命中窗口链）：图面图形视图链含 MFC 文档视图类 AfxFrameOrView（…<MDIClient<AfxMDIFrame）；
-            // 页导航器是停靠对话框里的树（AfxWnd < #32770 < Afx:ControlBar…），不含 AfxFrameOrView。
+            // 页导航器/查找结果是停靠面板里的列表（AfxWnd/#32770/Afx:ControlBar 等），不含 AfxFrameOrView。
             // 注意：菜单 owner 被 MFC 路由到主框架，绝不能用 owner hwnd/类名判，只能用右键瞬间光标实际所在窗口。
             string chain = CursorHitChain();
             bool isGedMenu = chain.IndexOf("AfxFrameOrView", StringComparison.Ordinal) >= 0;
             bool enabled = isGedMenu
-                ? TextBatchEditAction.SelectionHasText()   // 图纸：严格只认选中的文本对象
-                : TextBatchEditAction.SelectionHasPage(); // 页导航器：选中页/结构节点
-            AddInLogger.Info("右键菜单：来源=" + (isGedMenu ? "图纸(AfxFrameOrView)" : "页导航器")
+                ? TextBatchEditAction.SelectionHasText()                       // 图纸：严格只认选中的文本对象
+                : (TextBatchEditAction.SelectionHasText()                      // 查找结果：选中结果里的文本对象
+                   || TextBatchEditAction.SelectionHasPage());                 // 页导航器/结果：选中页或结构节点→整页
+            AddInLogger.Info("右键菜单：来源=" + (isGedMenu ? "图纸(AfxFrameOrView)" : "列表(页导航器/查找结果)")
                 + " 可编辑=" + enabled + " cursorHitChain=" + chain + " pos=" + i);
             if (enabled)
             {

@@ -188,6 +188,7 @@ new Decider().Decide(
 `new Menu().AddMenuItem("菜单文本", "ActionName")` —— 2 参数重载，追加到"实用工具/工具"菜单末尾，在 `OnInitGui` 中调用。
 右键菜单用 `ContextMenu` + `ContextMenuLocation`：
 - **图形编辑器（图纸页面对象）右键**：`DialogName="Editor"`、`ContextMenuName="Ged"`——两个属性分别赋值，**不能拼成 `"Editor.Ged"`**（实测可用，见 EPL-Scripts 的 ContextMenuHelloWorld）。注册：`new ContextMenu().AddMenuItem(loc, "菜单文本", "ActionName", separatorBefore, separatorBehind)`，在 `OnInitGui` 调用
+- **同一菜单项另挂两处**（共用同一 Action，钩子按右键瞬间光标窗口链区分表面）：页导航器 `DialogName="PmPageObjectTreeDialog"`、`ContextMenuName="1007"`；查找结果选项卡 `DialogName="XSeSearchResultsTab1"`、`ContextMenuName="1002"`（内部标识 `XSeSearchResultsDlg/Tab1/Tab3` 取自 `Bin\SearchAndReplaceGuiu.erx` 二进制；**注册是否生效、结果行是否进入 SelectionSet 待 EPLAN 实测**）。
 - 菜单项启用/隐藏：`IEplActionEnable.Enabled` **仅对主菜单/工具栏/Ribbon 生效；对 `Editor/Ged` 图形编辑器右键注入项 EPLAN 完全不回调（2.9 日志验证全程无调用）**，`ContextMenu` 也无置灰/隐藏属性。官方菜单项的置灰/隐藏由平台内部代码控制，未开放给第三方。第三方（DanielPa/Eplanwiki SwitchMacroVariant，同样挂 Editor/Ged）也只能常驻+点击时校验。
 - 试过且**被日志证伪**的动态时机：① 400ms 轮询（可行但被否决，性能/时序差）；② `new EventHandler("onActionEnd.String.*").NameEvent`——订阅成功，启动期有 selectionset/XGedOpenSchemePage 等内部事件，但**用户在图形编辑器里的点选/框选/右键一条 onActionEnd 都不发**（2.9 实测），不能用来跟踪选择。
 - ❌ **WinForms 消息过滤器也已实测证伪（2.9）**：物理右键确认落在 GED 画布（WindowFromPoint pid=EPLAN），右键确实弹出 MFC 菜单（出现 `Afx:...:800...` 弹出窗口类），但 `Application.AddMessageFilter` 全程零回调。根因：EPLAN 主界面是 **MFC/BCG 自己的消息循环（主窗口类 `AfxMDIFrame140u`），不是 WinForms `Application.Run`**，IMessageFilter 只在 WinForms 消息泵被查询，MFC 泵取消息时不经过它。
