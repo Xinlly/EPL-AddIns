@@ -82,7 +82,10 @@ dotnet build EPL-AddIns.slnx
 
 - **默认在代码修改完成后自动执行 `dotnet build` 验证编译通过**（2026-09-11 起的约定，无需等待指示）；用户明确说"先别编译"时例外。
 - 修改代码只动与需求直接相关的行，禁止整文件重写、顺手改格式/注释。
-- **助手可以也应当用 cua-driver 在测试机自测 EPLAN**（2026-09-15 起用户明确授权：宿主机 EPLAN 就是测试用的，直接重启即可，不要在重启上畏缩、不要再说"跑不了 EPLAN"）。但没真正执行/没看到结果就不得声称"已验证"。
+- **EPLAN 自测分层口径**（2026-09-18 xavier 裁定分层口径，替代 2026-09-15 的笼统授权表述）：
+  - **工程/客观自测——允许且鼓励 agent 做**：用 cua-driver 启动/重启 EPLAN、在 Add-in 管理器注册/注销 Add-in DLL、驱动 UI 复现机制与路径、读插件日志取得客观证据。宿主机 EPLAN 就是测试机，重启不必畏缩、不要再说"跑不了 EPLAN"（沿用既有 `scripts/restart-eplan.ps1`、`scripts/verify-addin-loaded.ps1`，直接调用不重写）。
+  - **UX/主观体验评估与最终验收闸门在人（xavier）**：agent 不得仅凭自测宣称"已验证可用/性能达标/UX 通过"，只能陈述客观现象（版本号/SHA-256、日志、截图/窗口类名、复现步骤的结果）；是否"好用/通过"由人判定。
+  - **未真正执行、未看到结果，不得声称已验证**。
 
 ### 重启 / 自测 EPLAN 的固定坑（必看，已反复踩过）
 
@@ -289,8 +292,9 @@ Hello World 骨架，验证 Add-in 全链路：
 ### 构建与实测流（编排视角）
 
 - 开发构建在 worktree 内：`./scripts/build.sh <ProjectName>`（动态版本，6 分钟桶；**P2 参数化前脚本不接参数，仍只构建 TextBatchEdit**），写不入库的 `.temp/<ProjectName>.DynamicVersion.props`，构建后写 `.temp/<ProjectName>.build-version.json`。
-- 产物：`<worktree>/EA.EplAddIn.<名称>/bin/Debug/net472/EA.EplAddIn.<名称>.dll`；人直接注册该 NTFS 路径 DLL 实测，EPLAN「API 模块」版本号与 build-version.json 对照，反馈带版本号以锚定冻结的那次构建。
-- DLL 被 EPLAN 加载期间有文件锁：worker 重新构建前须由人先在 Add-in 管理器注销（必要时退 EPLAN）；锁定期 worker 可继续写未编译代码，但不得 build。注册/注销与 EPLAN 内实测只由 xavier 完成，agent 未实测不得宣称通过。
+- 产物：`<worktree>/EA.EplAddIn.<名称>/bin/Debug/net472/EA.EplAddIn.<名称>.dll`；agent 可注册该 NTFS 路径 DLL 做工程/客观自测，xavier 验收时同样加载该路径 DLL 实测；无论谁加载，都以 EPLAN「API 模块」版本号与 build-version.json 对照，反馈带版本号以锚定冻结的那次构建。
+- DLL 被 EPLAN 加载期间有文件锁：worker 重新构建前可自行用既有手段解除——在 Add-in 管理器注销（必要时退 EPLAN，再用 `scripts/restart-eplan.ps1` 或 cua-driver 自行重启），不必等人；锁定期 worker 可继续写未编译代码，但不得 build。
+- 注册/注销与 EPLAN 内实测按自测分层口径执行（见「协作约定」节）：注册/注销与工程/客观自测 agent 可自行做；UX/主观体验评估、验收实测与放行由 xavier 完成。agent 未真正实测不得宣称通过。
 - 正式构建只在 main 由 `scripts/release-from-develop.sh`（先 `--dry-run`）完成；develop 不产生发布物，任何 agent 不得自行推进 main。
 - 维护期（插件已在 develop/main 之后）不留常驻 worktree/agent，连续性靠 `docs/design/<插件>/design.md`、`git log -- <插件目录>`、AGENT.md 与 skill；L1 小修 / L2 增强 / L3 紧急修复的出线、编制与合入规则见 `paseo-orchestrator` skill（L3 自 origin/main 最新 tag 出线、main 打补丁 tag 后回流 develop）。
 
