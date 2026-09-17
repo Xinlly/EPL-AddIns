@@ -251,6 +251,60 @@ Hello World 骨架，验证 Add-in 全链路：
 
 ---
 
+## 多 Agent 编排（本项目约定）
+
+> 2026-09-16 起。通用编排规则——管理链两流（需求直达/治理线）、orchestrator/planner/worker/reviewer 角色、三层命名（workspace 标题=slug=分支）、primary 只读红线、强制预检清单、临时 worktree 合并、Paseo CLI/MCP 拓扑、维护分级 L1/L2/L3——统一在跨项目 skill `paseo-orchestrator`，本节不复制；本文件只记录本仓库特有的事实与差异，派生 agent 的任务说明以 skill 为准。
+
+### 仓库事实（多插件并行的架构约束）
+
+- 一个 `EPL-AddIns.slnx` 下挂多个 `EA.EplAddIn.*` C# 类库（net472 / x64 / WinForms），每个插件独占目录与 csproj，**项目之间零项目引用**。
+- `references/EplApi/` 下 13 个 EPLAN 专有 DLL 不入库（`.gitignore` 已忽略 `references/`），csproj 以 `..\references\EplApi\*.dll` 相对路径引用、`<Private>False</Private>`，运行时由 EPLAN 进程提供。
+- 因项目间无代码引用，并行开发的冲突面只有四类公共文件：`EPL-AddIns.slnx`、`EA.EplAddIn.Shared/`、`scripts/`、`AGENT.md`；它们归公共（chore）worktree 独占，插件分支不得改动其他插件目录（归属矩阵见下）。
+- 双轨：`develop` 日常集成（`build.sh` 动态版本）；`main` 只由 `scripts/release-from-develop.sh` 推进（固化 `release-version.props` + Release 校验 + annotated tag）。截至 2026-09-16，main 领先 develop 13 个发布专用提交（最新 tag `v1.0.2609.16118`）、develop 无未发布提交，是发布脚本反复推进 main 的正常状态，不是冲突性分叉。
+- 现状：仅 Test、TextBatchEdit 两个插件项目；无 `EA.EplAddIn.Shared/`；仓库尚无 `paseo.json`、无附加 worktree；`build.sh`/`release-from-develop.sh` 硬编码 TextBatchEdit 单项目。
+
+### 文件归属矩阵
+
+| 路径 | 插件 worktree（feat/fix/hotfix） | 公共 worktree（chore） |
+|---|---|---|
+| `EA.EplAddIn.<本插件>/` | 自由修改 | 不动 |
+| `docs/design/<本插件>/` | 自由修改（设计文档随分支合入 develop，不写进 AGENT.md） | 不动 |
+| `EPL-AddIns.slnx` | **禁止** | 仅新插件 onboarding 挂 csproj 时改（唯一合法改动） |
+| `EA.EplAddIn.Shared/` | **禁止** | 仅此可改；插件需增强先向协调者提需求，公共线先合 develop、插件 rebase 后再用 |
+| `scripts/` | **禁止** | 仅此可改（构建/发布是全仓库基础设施） |
+| `AGENT.md` | **禁止** | 仅此可改（通用约定变更走公共线） |
+| `references/` | 不可改（不入库） | 由 `paseo.json` setup 从源 checkout 就位 |
+| `.temp/` | worktree 私有（不入库），不放跨 worktree 知识 | — |
+| 其他插件目录 | **禁止** | bootstrap 一次性任务例外（如 Shared 抽取时统一改引用） |
+
+### 新插件 onboarding（P1–P4，仅本仓库这种多插件解决方案需要）
+
+- **P1 `chore/repo-setup`（一次性，未开工）**：新增 `paseo.json`，setup 从 `$PASEO_SOURCE_CHECKOUT_PATH` 准备 `references/`（优先 `cp -al` 硬链接，失败回退 `cp -r`），teardown 无需动作；按需把 Paseo `worktrees.root` 配到 /mnt/d 下目录——EPLAN 是 Windows 进程，实测必须加载 NTFS 原生路径 DLL，规避 `\\wsl.localhost` 远程程序集风险。验收：临时 worktree 内 references 就位 + Windows `dotnet.exe build EPL-AddIns.slnx` 0 error。
+  - [UNCERTAIN] drvfs 下硬链接是否可用、`worktrees.root` 配置效果、archive workspace 是否自动删分支——均未实测，P1 验收时回填。
+- **P2 `chore/build-bootstrap`（一次性，未开工，两个独立提交）**：① 脚本参数化——`build.sh <ProjectName>` / `release-from-develop.sh <ProjectName>`，动态 props 与版本记录按项目命名（`.temp/<ProjectName>.DynamicVersion.props`、`.temp/<ProjectName>.build-version.json`，杜绝并行构建互相覆盖），tag 注解按项目区分，TextBatchEdit csproj 内硬编码文件名改按 `$(MSBuildProjectName)` 推导；② 抽 `EA.EplAddIn.Shared`——AddInLogger 现存 Test/TextBatchEdit 两份同构副本（AGENT.md 早已约定第三个插件时抽取），迁入 Shared 后两项目改引用、删副本、Shared 挂 slnx。验收：整 slnx 构建 0 error，TextBatchEdit 动态构建与发布 dry-run 不回退；动了两个现有项目，加一次性 reviewer。
+  - [UNCERTAIN] 参数化后的发布脚本端到端真实发布未验证（当前 `release-version.props` 只存在于 main，develop 无，脚本此前仅 dry-run 过）。
+- **P3 新插件骨架（微型公共任务，每个新插件一次）**：公共 worktree（单 worker，小时级）新建 `EA.EplAddIn.<名称>/` 空骨架（csproj net472 + 最小 IEplAddIn 生命周期，参照 Test）+ 挂 slnx，整 slnx 编译通过，人合 develop 后 archive。骨架必须先于插件 worktree 存在，使插件分支永不碰 slnx。
+- **P4 `feat/<plugin>` 插件 worktree（正式开发）**：planner 产出 `docs/design/<plugin>/design.md` → 闸门 A（人审设计、确认范围）→ worker 按里程碑实现（每里程碑 `build.sh <ProjectName>` 0 error 并整 slnx 构建一次）→ 每里程碑 reviewer（全新会话、只读）→ 闸门 B（人在 EPLAN 实测 worktree 产出的 DLL）→ 人授权后协调者在临时 worktree 以 `--no-ff` 合入 develop、推送、archive。
+
+### 构建与实测流（编排视角）
+
+- 开发构建在 worktree 内：`./scripts/build.sh <ProjectName>`（动态版本，6 分钟桶；**P2 参数化前脚本不接参数，仍只构建 TextBatchEdit**），写不入库的 `.temp/<ProjectName>.DynamicVersion.props`，构建后写 `.temp/<ProjectName>.build-version.json`。
+- 产物：`<worktree>/EA.EplAddIn.<名称>/bin/Debug/net472/EA.EplAddIn.<名称>.dll`；人直接注册该 NTFS 路径 DLL 实测，EPLAN「API 模块」版本号与 build-version.json 对照，反馈带版本号以锚定冻结的那次构建。
+- DLL 被 EPLAN 加载期间有文件锁：worker 重新构建前须由人先在 Add-in 管理器注销（必要时退 EPLAN）；锁定期 worker 可继续写未编译代码，但不得 build。注册/注销与 EPLAN 内实测只由 xavier 完成，agent 未实测不得宣称通过。
+- 正式构建只在 main 由 `scripts/release-from-develop.sh`（先 `--dry-run`）完成；develop 不产生发布物，任何 agent 不得自行推进 main。
+- 维护期（插件已在 develop/main 之后）不留常驻 worktree/agent，连续性靠 `docs/design/<插件>/design.md`、`git log -- <插件目录>`、AGENT.md 与 skill；L1 小修 / L2 增强 / L3 紧急修复的出线、编制与合入规则见 `paseo-orchestrator` skill（L3 自 origin/main 最新 tag 出线、main 打补丁 tag 后回流 develop）。
+
+### 临时边界：TextBatchEdit 尚未交接（2026-09-16 起，解除待 xavier 宣布）
+
+「文本批量编辑」工作线目前仍在既有方式下推进，未交接给编排体系。在 xavier 明确宣布交接完成前：
+
+- 不得就 TextBatchEdit 派生任何 agent、创建 worktree/分支、改动 `EA.EplAddIn.TextBatchEdit/` 下任何文件、触发其构建或发布；
+- 不得触碰旧工作区 `wks_140f20f3da41008d`（「文本批量编辑」）及其中普通会话 agent `cc090ea`（「本地」）：禁止发消息/归档/改名/任何操作；
+- 已归档旧协调者 `32d0d172`、`a752e95a` 保持不动；
+- 本节其余编排约定对未来其他插件线照常适用；边界一经宣布解除，TextBatchEdit 即按本节常规规则纳管。
+
+---
+
 ## 通用知识指针（不重复维护）
 
 以下内容在 EPL-Scripts 仓库的 AGENT.md 中，Add-in 同样适用，需要时去查：
