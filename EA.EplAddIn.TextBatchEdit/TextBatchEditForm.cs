@@ -5,6 +5,7 @@ using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.Linq;
+using System.Runtime.InteropServices;
 using System.Windows.Forms;
 
 namespace EA.EplAddIn.TextBatchEdit;
@@ -74,6 +75,17 @@ public class TextBatchEditForm : Form
     private float _zoom = 1f;
     private const float ZoomMin = 0.7f, ZoomMax = 1.8f, ZoomStep = 0.1f;
 
+    private const int WM_SETREDRAW = 0x000B;
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
+
+    // 批量改网格前挂起重绘以消除闪烁；句柄未创建时跳过（首次布局阶段无需挂起）
+    private void SetGridRedraw(bool allow)
+    {
+        if (_grid.IsHandleCreated) { SendMessage(_grid.Handle, WM_SETREDRAW, allow ? (IntPtr)1 : IntPtr.Zero, IntPtr.Zero); }
+    }
+
     /// <summary>Ctrl+滚轮：以光标为中心整体缩放表格字体、列宽、行高（行号列宽随字体自适应）。</summary>
     private void ZoomGrid(bool zoomIn)
     {
@@ -85,25 +97,35 @@ public class TextBatchEditForm : Form
         _baseGridFont ??= _grid.Font; // 首次缩放时记录原始字体（不释放它）
         var ratio = newZoom / _zoom;
 
-        // 列宽、行高相对当前值按比例缩放（不缓存绝对值，重载/自适应后仍可继续缩放）
-        foreach (DataGridViewColumn col in _grid.Columns)
+        // 列宽/行高/字体三段布局改动期间挂起重绘，避免逐项缩放闪烁；恢复后整表失效一次统一重绘
+        try
         {
-            if (!col.Visible) { continue; }
-            col.Width = Math.Max(20, (int)Math.Round(col.Width * ratio));
+            SetGridRedraw(false);
+            // 列宽、行高相对当前值按比例缩放（不缓存绝对值，重载/自适应后仍可继续缩放）
+            foreach (DataGridViewColumn col in _grid.Columns)
+            {
+                if (!col.Visible) { continue; }
+                col.Width = Math.Max(20, (int)Math.Round(col.Width * ratio));
+            }
+            foreach (DataGridViewRow row in _grid.Rows)
+            {
+                row.Height = Math.Max(14, (int)Math.Round(row.Height * ratio));
+            }
+
+            // 字体按基准字体 × 因子重建（表头/编辑控件均继承 grid.Font）
+            var old = _appliedGridFont;
+            _appliedGridFont = new Font(_baseGridFont.FontFamily, _baseGridFont.Size * newZoom,
+                _baseGridFont.Style, _baseGridFont.Unit, _baseGridFont.GdiCharSet, _baseGridFont.GdiVerticalFont);
+            _grid.Font = _appliedGridFont;
+            old?.Dispose();
+
+            _zoom = newZoom;
         }
-        foreach (DataGridViewRow row in _grid.Rows)
+        finally
         {
-            row.Height = Math.Max(14, (int)Math.Round(row.Height * ratio));
+            SetGridRedraw(true);
         }
-
-        // 字体按基准字体 × 因子重建（表头/编辑控件均继承 grid.Font）
-        var old = _appliedGridFont;
-        _appliedGridFont = new Font(_baseGridFont.FontFamily, _baseGridFont.Size * newZoom,
-            _baseGridFont.Style, _baseGridFont.Unit, _baseGridFont.GdiCharSet, _baseGridFont.GdiVerticalFont);
-        _grid.Font = _appliedGridFont;
-        old?.Dispose();
-
-        _zoom = newZoom;
+        _grid.Invalidate(true);
     }
 
 
@@ -1702,6 +1724,7 @@ public class TextBatchEditForm : Form
         _syncing = true;
         try
         {
+            SetGridRedraw(false); // 批量重建期间挂起重绘消除闪烁；finally 中务必与 _syncing 一并恢复
             _grid.Rows.Clear();
             var ri = 0;
             foreach (var v in sorted)
@@ -1720,6 +1743,7 @@ public class TextBatchEditForm : Form
         finally
         {
             _syncing = false;
+            SetGridRedraw(true);
         }
 
         // 触发列头重绘，由 CellPainting 在当前排序列表头叠加箭头字符
@@ -2538,6 +2562,8 @@ public class TextBatchEditForm : Form
     /// </summary>
     private sealed class EditGrid : DataGridView
     {
+        public EditGrid() { DoubleBuffered = true; }
+
         public Action<Keys>? GridClipboardCommand;
         public Func<bool>? IsGridEditing;
         public Action<bool>? ZoomGrid; // 参数：true=放大，false=缩小
