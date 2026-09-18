@@ -504,11 +504,17 @@ public class TextBatchEditForm : Form
             {
                 tb.TextChanged -= EditingTextChanged;
                 tb.TextChanged += EditingTextChanged;
+                // P2-b：进入新格文本编辑时重置自动保存计时，防抖锚点不得还挂在前一格；
+                // 提交后由 CellEndEdit/CellValueChanged/TextChanged 重新计时。
+                _autoSaveTimer?.Stop();
                 // 编辑态承载焦点的是内嵌文本框，默认用系统菜单（没有我们的“换行/转到图形”）；
                 // 显式挂专用菜单，保证编辑中右键也能插入 ¶、转到图形。
                 tb.ContextMenuStrip = BuildEditMenu(tb);
             }
         };
+        // 编辑结束（含 Esc 取消这类不触发 CellValueChanged 的路径）重新排一次，
+        // 闭合 EditingControlShowing 停表后“再也不保存”的可能。
+        _grid.CellEndEdit += (_, _) => ScheduleAutoSave();
         _grid.DataError += (_, e) =>
         {
             AddInLogger.Warn("网格 DataError: ctx=" + e.Context + " " + (e.Exception?.Message ?? ""));
@@ -1791,6 +1797,13 @@ public class TextBatchEditForm : Form
         UpdateApplyEnabled();
     }
 
+    /// <summary>当前格正处于文本编辑（承载焦点的 TextBoxBase 编辑控件已就位）。
+    /// 自动保存遇到此状态本轮跳过：既不保存也不 EndEdit，避免打断用户正在编辑的格子。</summary>
+    private bool IsCurrentTextCellEditing() =>
+        _grid.IsCurrentCellInEditMode
+        && _grid.EditingControl is TextBoxBase tb
+        && tb.Focused;
+
     private void ScheduleAutoSave()
     {
         if (_saving || _autoSaveChk == null || !_autoSaveChk.Checked) { return; }
@@ -1802,12 +1815,19 @@ public class TextBatchEditForm : Form
             {
                 _autoSaveTimer.Stop();
                 if (IsDisposed || _saving || _autoSaveChk == null || !_autoSaveChk.Checked) { return; }
+                // P2-b 守卫：当前格仍在文本编辑时本轮不保存、不 EndEdit，重启防抖稍后重试；
+                // 用户提交该格后由 CellEndEdit/CellValueChanged/TextChanged 自然再调度，保证脏数据最终落库。
+                if (IsCurrentTextCellEditing())
+                {
+                    _autoSaveTimer.Start();
+                    return;
+                }
                 if (DirtyRows().Count == 0) { return; }
                 _saving = true;
                 try
                 {
                     AddInLogger.Debug("自动保存触发");
-                    SaveDirty(quietSuccess: true);
+                    SaveDirty(quietSuccess: true, commitCurrentEdit: false);
                 }
                 finally
                 {
@@ -1827,7 +1847,7 @@ public class TextBatchEditForm : Form
     private void EditingTextChanged(object? sender, EventArgs e)
     {
         if (_applyBtn is { Enabled: false }) { _applyBtn.Enabled = true; }
-        ScheduleAutoSave(); // 当前格未提交也计时；SaveDirty 开头会先 EndEdit 提交
+        ScheduleAutoSave(); // 编辑中每键仅重置防抖；到点时若仍在编辑，Tick 守卫会跳过本轮而不打断输入
     }
 
     /// <summary>
@@ -2265,11 +2285,13 @@ public class TextBatchEditForm : Form
     /// 增量保存：无脏行直接返回成功且不建撤销点；有脏行才开启一个 UndoStep+Transaction，
     /// 只写脏对象、且只动变化的字段（Contents / IsAutomaticallyTranslated）。确定与应用共用本方法。
     /// </summary>
+    /// <param name="commitCurrentEdit">true（默认，手动“应用/确定”、刷新选择集等显式路径）先提交当前编辑格，保证“最后一格未离开也能保存”；
+    /// false（仅自动保存）：不 EndEdit 当前格，调用方已先做编辑态守卫，只写已提交的脏行。</param>
     /// <returns>true=可关窗（无修改或写回并校验一致）；false=异常或回读不一致，保留窗口。</returns>
-    private bool SaveDirty(bool quietSuccess = false)
+    private bool SaveDirty(bool quietSuccess = false, bool commitCurrentEdit = true)
     {
-        // 先结束正在进行的单元格编辑，避免最后一格输入未提交
-        if (_grid.IsCurrentCellInEditMode) { _grid.EndEdit(); }
+        // 先结束正在进行的单元格编辑，避免最后一格输入未提交（仅显式保存路径；自动保存路径不打断编辑）
+        if (commitCurrentEdit && _grid.IsCurrentCellInEditMode) { _grid.EndEdit(); }
 
         var dirty = DirtyRows();
         if (dirty.Count == 0)
