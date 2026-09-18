@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Build TextBatchEdit.
-# - Dynamic develop builds: write .temp/TextBatchEdit.DynamicVersion.props (6-minute bucket) first.
+# - Non-fixed builds: csproj computes the dynamic 6-minute version itself from the
+#   current time; the .temp/TextBatchEdit.DynamicVersion.props written below is kept
+#   for traceability only and is NO LONGER IMPORTED by the csproj.
 # - Fixed main/tag builds: committed EA.EplAddIn.TextBatchEdit/release-version.props takes precedence.
 
 set -euo pipefail
@@ -21,7 +23,8 @@ BRANCH="$(git branch --show-current 2>/dev/null || true)"
 FORCE_DYNAMIC=0
 [[ "$BRANCH" == "$DEVELOP_BRANCH" ]] && FORCE_DYNAMIC=1
 
-# develop 强制动态，或没有固化文件时，生成 6 分钟粒度的动态版本 props。
+# develop 强制动态，或没有固化文件时，写一份 6 分钟桶 props 作为本次构建的可追溯记录
+# （csproj 不再导入它；实际版本由 csproj 在非固化分支内按当前时间现算，公式与此处相同）。
 if [[ "$FORCE_DYNAMIC" -eq 1 || ! -f "$RELEASE_PROPS" ]]; then
   build_part="$(date +%y%m)"
   day=$((10#$(date +%d)))
@@ -39,7 +42,7 @@ if [[ "$FORCE_DYNAMIC" -eq 1 || ! -f "$RELEASE_PROPS" ]]; then
 </Project>
 PROPS
 
-  # develop 上即使误带固化文件也忽略：指向不存在的路径，使 csproj 回落到动态 props。
+  # develop 上即使误带固化文件也忽略：指向不存在的路径，使 csproj 进入非固化现算分支。
   EXTRA_ARGS=()
   [[ "$FORCE_DYNAMIC" -eq 1 ]] && \
     EXTRA_ARGS+=("-p:ReleaseVersionFile=$(wslpath -w "$ROOT/.temp/__no-release.props")")
