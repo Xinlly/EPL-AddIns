@@ -124,6 +124,24 @@ public class TextBatchEditForm : Form
         if (_grid.IsHandleCreated) { SendMessage(_grid.Handle, WM_SETREDRAW, allow ? (IntPtr)1 : IntPtr.Zero, IntPtr.Zero); }
     }
 
+    /// <summary>
+    /// 行首宽按总行数【位数】程序化设一次固定宽（替代 AutoSizeToAllHeaders 的全量行首 GDI 测量）：
+    /// 只对最长行号串（n 的位数）做一次 TextRenderer.MeasureText（O(1)，与行数无关），加行首内边距与
+    /// 当前行指示箭头留白，保证 10000 行时“10000”不被截。调用前置为 DisableResizing（见 BuildGrid）。
+    /// </summary>
+    private void EnsureRowHeadersWidth(int n)
+    {
+        if (n <= 0) { return; }
+        var longest = new string('9', n.ToString().Length);
+        // 屏幕 DC：构造函数里 ApplyDefaultOrder 首次调用时网格句柄尚未创建，FromHwnd(Zero) 不依赖句柄、不强制提前建窗
+        using var g = Graphics.FromHwnd(IntPtr.Zero);
+        var w = TextRenderer.MeasureText(g, longest, _grid.Font, Size.Empty,
+            TextFormatFlags.SingleLine | TextFormatFlags.NoPadding).Width;
+        // 行首左右内边距 + 右侧当前行指示箭头留白（AutoSize 结果同样含此项），随 DPI 缩放
+        var pad = (int)Math.Ceiling(16.0 * g.DpiY / 96.0);
+        _grid.RowHeadersWidth = w + pad;
+    }
+
     /// <summary>Ctrl+滚轮：以光标为中心整体缩放表格字体、列宽、行高（行号列宽随字体自适应）。</summary>
     private void ZoomGrid(bool zoomIn)
     {
@@ -158,6 +176,8 @@ public class TextBatchEditForm : Form
             old?.Dispose();
 
             _zoom = newZoom;
+            // 固定行首宽不随字体自动重算（旧 AllHeaders 模式会自动跟随）：缩放字体后按位数重设，避免大字号截字
+            EnsureRowHeadersWidth(_grid.Rows.Count);
         }
         finally
         {
@@ -425,8 +445,9 @@ public class TextBatchEditForm : Form
             SelectionMode = DataGridViewSelectionMode.CellSelect,
             MultiSelect = true,
             RowHeadersVisible = true,   // 最左行首列：显示行号，兼作行选择/拖拽行高
-            // 强制按最宽行号内容自适应列宽；该模式下行首宽度恒由内容决定，用户拖拽会被自动值覆盖（即禁止手动调宽）
-            RowHeadersWidthSizeMode = DataGridViewRowHeadersWidthSizeMode.AutoSizeToAllHeaders,
+            // 行首宽不用 AutoSizeToAllHeaders（增删行/排序时对全部行首做 GDI 测量）：
+            // 改由 EnsureRowHeadersWidth 按总行数位数程序化设定固定宽（O(1)）；DisableResizing 同样禁止用户拖拽改宽，行高拖拽仍走内置分隔条
+            RowHeadersWidthSizeMode = DataGridViewRowHeadersWidthSizeMode.DisableResizing,
             AllowUserToResizeRows = true,    // 内置行高拖拽分隔条只出现在行号（行首）列底边，数据列不可拖
             BackgroundColor = System.Drawing.Color.White,
             ClipboardCopyMode = DataGridViewClipboardCopyMode.EnableWithoutHeaderText,
@@ -1811,25 +1832,28 @@ public class TextBatchEditForm : Form
             _meta[i] = sorted[i].Meta;
         }
 
-        // 重建网格行（带回原值与手调行高）
+        // 原地搬值重排（A9）：排序前后行数恒为 n，复用现有物理行，不 Clear/Add（省掉 N 个 DataGridViewRow
+        // 及全部单元格对象的销毁重建）。显示行 i 承 sorted[i]，其值/行高/可编辑性逐行搬齐。
         _syncing = true;
         try
         {
-            SetGridRedraw(false); // 批量重建期间挂起重绘消除闪烁；finally 中务必与 _syncing 一并恢复
-            _grid.Rows.Clear();
-            var ri = 0;
-            foreach (var v in sorted)
+            SetGridRedraw(false); // 批量搬值期间挂起重绘消除闪烁；finally 中务必与 _syncing 一并恢复
+            for (var i = 0; i < n; i++)
             {
-                var row = _grid.Rows[_grid.Rows.Add()];
+                var v = sorted[i];
+                var row = _grid.Rows[i];
                 for (var c = 0; c < colCount; c++) { row.Cells[c].Value = v.Values[c]; }
                 // 行头 = 当前显示行号（随排序即时变）；底色与列标题一致、无列标题
-                row.HeaderCell.Value = (ri + 1).ToString();
-                // 序号列：仅在“默认排序”时盖章为固定排名 1..n；按其它列排序时沿用已盖章值（随文本一起搬运）
-                if (dir == 0) { row.Cells[ColIndex].Value = (ri + 1).ToString(); }
+                row.HeaderCell.Value = (i + 1).ToString();
+                // 序号列：仅在“默认排序”时盖章为固定排名 1..n；按其它列排序时沿用已盖章值（随 v.Values 一并搬入，不再覆盖）
+                if (dir == 0) { row.Cells[ColIndex].Value = (i + 1).ToString(); }
                 row.Height = v.Height;
-                SetRowEditable(ri, Convert.ToBoolean(v.Values[ColMultilang] ?? false));
-                ri++;
+                SetRowEditable(i, Convert.ToBoolean(v.Values[ColMultilang] ?? false));
             }
+            // 等价旧重建语义：Rows.Clear()+Add 后无任何选中且 CurrentCell=null。复用行不 Clear，
+            // 旧选区/CurrentCell 会残留在此刻已承载别的对象的物理行上，必须显式清到同一状态。
+            _grid.ClearSelection();
+            _grid.CurrentCell = null;
         }
         finally
         {
@@ -1837,8 +1861,8 @@ public class TextBatchEditForm : Form
             SetGridRedraw(true);
         }
 
-        // 触发列头重绘，由 CellPainting 在当前排序列表头叠加箭头字符
-        _grid.AutoResizeRowHeadersWidth(DataGridViewRowHeadersWidthSizeMode.AutoSizeToAllHeaders); // 行号位数变化时列宽跟随
+        // 行首宽只按总行数位数程序化设一次（O(1) 次 GDI 测量），替代对全部行首测量的 AutoResizeRowHeadersWidth
+        EnsureRowHeadersWidth(n);
         if (PerfTrace) { _perfInvSort++; } // TEMP-PERF Invalidate 来源：ApplySort
         _grid.Invalidate(_grid.DisplayRectangle);
         _grid.Refresh(); // 同步重绘：返回到此处可见区单元格基本已绘制（CellFormatting 已完成）
