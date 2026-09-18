@@ -53,6 +53,8 @@ public class TextBatchEditForm : Form
     private CtrlJFilter? _ctrlJFilter;
     private Timer? _autoSaveTimer;
     private bool _saving; // 抑制保存/刷新过程中自动保存的重入
+    // “确定/取消”按钮自身的关闭路径：已由按钮语义处理过修改，关窗时不再弹三态询问
+    private bool _suppressClosePrompt;
 
 
     // 双击列标题三级排序：默认(结构→X↑→Y↓) → 升 → 降 → 默认
@@ -194,6 +196,30 @@ public class TextBatchEditForm : Form
         Application.AddMessageFilter(_ctrlJFilter);
         // 窗体真正显示（grid 句柄已建）后：按两个开关初始化列可见性（内含一次自动列宽）
         Shown += (_, _) => UpdateColumnVisibility();
+    }
+
+    protected override void OnFormClosing(FormClosingEventArgs e)
+    {
+        // 仅拦截用户点 X / Alt+F4 / 系统菜单关闭；属主关闭、应用退出、关机、任务管理器结束等一律放行
+        if (e.CloseReason == CloseReason.UserClosing && !_suppressClosePrompt)
+        {
+            var dirtyRows = DirtyRows();
+            // IsCurrentCellDirty 覆盖“正在编辑还没离开该格”：编辑控件里的改动尚未提交进单元格值，DirtyRows() 暂时不计该行
+            var editRow = _grid.CurrentCell?.RowIndex ?? -1;
+            var uncommittedRow = _grid.IsCurrentCellDirty && editRow >= 0 && !dirtyRows.Contains(editRow);
+            if (dirtyRows.Count > 0 || uncommittedRow)
+            {
+                var dirtyCount = dirtyRows.Count + (uncommittedRow ? 1 : 0);
+                var ans = MessageBox.Show(
+                    "当前有 " + dirtyCount + " 处修改尚未保存。\n\n" +
+                    "“是”保存修改后关闭；\n“否”放弃未保存修改并关闭；\n“取消”返回继续编辑。",
+                    "文本批量编辑", MessageBoxButtons.YesNoCancel, MessageBoxIcon.Question);
+                if (ans == DialogResult.Cancel) { e.Cancel = true; }
+                else if (ans == DialogResult.No) { /* 放弃改动，直接放行（等同“取消”按钮语义） */ }
+                else if (!SaveDirty(quietSuccess: true)) { e.Cancel = true; } // 保存失败（如回读不一致）则留窗
+            }
+        }
+        base.OnFormClosing(e);
     }
 
     protected override void OnFormClosed(FormClosedEventArgs e)
@@ -1189,10 +1215,11 @@ public class TextBatchEditForm : Form
         };
 
         _okBtn = new Button { Text = "确定", Width = 90, Height = 30, Margin = new Padding(0, 6, 8, 0) };
-        _okBtn.Click += (_, _) => { if (SaveDirty(quietSuccess: true)) { Close(); } };
+        // 仅在 SaveDirty 成功、确实要关窗前置位：保存失败不关窗，守卫保持 false，下次 X 仍正常拦截
+        _okBtn.Click += (_, _) => { if (SaveDirty(quietSuccess: true)) { _suppressClosePrompt = true; Close(); } };
 
         _cancelBtn = new Button { Text = "取消", Width = 90, Height = 30, Margin = new Padding(0, 6, 8, 0) };
-        _cancelBtn.Click += (_, _) => Close();
+        _cancelBtn.Click += (_, _) => { _suppressClosePrompt = true; Close(); };
 
         _applyBtn = new Button { Text = "应用", Width = 90, Height = 30, Margin = new Padding(0, 6, 12, 0) };
         _applyBtn.Click += (_, _) => SaveDirty(quietSuccess: true);
