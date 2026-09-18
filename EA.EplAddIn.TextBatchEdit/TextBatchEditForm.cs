@@ -2651,9 +2651,14 @@ public class TextBatchEditForm : Form
 
         public override bool EditingControlWantsInputKey(Keys keyData, bool dataGridViewWantsInputKey)
         {
+            var key = keyData & Keys.KeyCode;
             if ((keyData & Keys.KeyCode) == Keys.Enter && (keyData & Keys.Control) != 0)
             {
                 return true; // 自己消费 Ctrl+Enter
+            }
+            if (key == Keys.Home || key == Keys.End)
+            {
+                return true; // 双击全选时 Home/End 也留在文本内移动光标（Shift 选择到首/尾、Ctrl 文档首/尾），不让位 grid 跳行
             }
             return base.EditingControlWantsInputKey(keyData, dataGridViewWantsInputKey);
         }
