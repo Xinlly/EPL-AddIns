@@ -19,6 +19,11 @@ public class TextBatchEditAction : IEplAction
     /// <summary>当前已非模态打开的编辑窗（单例）；关闭后置 null。</summary>
     private static TextBatchEditForm? _openForm;
 
+    // TEMP-PERF 收集段独立开关：收集发生在 TextBatchEditForm 构造之前，不引用 Form 的开关（避免跨类耦合），
+    // 本类内放同名同默认 static readonly（不用 const：const false + if 触发 CS0162，已实测）。
+    // 真机量测时与 TextBatchEditForm.PerfTrace 一并改 true；验收后 grep TEMP-PERF 整体移除。
+    private static readonly bool PerfTrace = false; // TEMP-PERF 一键开关：真机量测时改 true
+
     /// <summary>把 EPLAN 主窗口句柄包装成 WinForms 属主，使浮动窗始终在主窗之上并随其最小化。</summary>
     private static IWin32Window? GetMainWindowOwner()
     {
@@ -99,6 +104,7 @@ public class TextBatchEditAction : IEplAction
         }
 
         AddInLogger.Info("CollectTexts: 页导航器显式选中页 count=" + pages.Length + "，枚举各页文本");
+        var perfAllPlacements = 0; // TEMP-PERF 各页 AllPlacements 物化对象总数（页内全部对象，非仅文本）
         foreach (var page in pages)
         {
             try
@@ -108,6 +114,7 @@ public class TextBatchEditAction : IEplAction
                 if (placements == null) { continue; }
                 foreach (var pl in placements)
                 {
+                    if (PerfTrace) { perfAllPlacements++; } // TEMP-PERF 复用既有遍历自增，不额外触发 native 往返
                     if (pl is TextBase tb2) { result.Add(tb2); }
                 }
             }
@@ -115,6 +122,11 @@ public class TextBatchEditAction : IEplAction
             {
                 AddInLogger.Warn("枚举页文本失败 页=" + SafePageName(page) + "：" + ex.Message);
             }
+        }
+        if (PerfTrace) // TEMP-PERF 页路径明细一行（页数 / AllPlacements 总数 / 命中文本数）
+        {
+            AddInLogger.Debug("PERF CollectTexts(页枚举明细): 页数=" + pages.Length
+                + " AllPlacements总数=" + perfAllPlacements + " 命中文本=" + result.Count);
         }
 
         if (result.Count > 0)
@@ -186,7 +198,14 @@ public class TextBatchEditAction : IEplAction
         try
         {
             // 收集待编辑文本：图面选中文本，或页导航器显式选中页；图面仅打开页而未选中时返回空（不枚举整页）。
+            var swPerfCollect = PerfTrace ? Stopwatch.StartNew() : null; // TEMP-PERF 收集总计
             var texts = CollectTexts(out var project, out var sourceDesc);
+            if (PerfTrace)
+            {
+                swPerfCollect!.Stop(); // TEMP-PERF
+                AddInLogger.Debug("PERF CollectTexts(调用点): 总=" + swPerfCollect.Elapsed.TotalMilliseconds.ToString("0.0") + "ms" // TEMP-PERF
+                    + " 文本数=" + texts.Count + " 来源=" + (string.IsNullOrEmpty(sourceDesc) ? "(空/未枚举 sourceDesc=N/A)" : sourceDesc));
+            }
 
             if (texts.Count == 0)
             {

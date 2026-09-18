@@ -3,8 +3,10 @@ using Eplan.EplApi.DataModel;
 using Eplan.EplApi.DataModel.Graphics;
 using System;
 using System.Collections.Generic;
+using System.Diagnostics; // TEMP-PERF
 using System.Drawing;
 using System.Linq;
+using System.Runtime.InteropServices;
 using System.Windows.Forms;
 
 namespace EA.EplAddIn.TextBatchEdit;
@@ -53,6 +55,45 @@ public class TextBatchEditForm : Form
     private CtrlJFilter? _ctrlJFilter;
     private Timer? _autoSaveTimer;
     private bool _saving; // 抑制保存/刷新过程中自动保存的重入
+    // “确定/取消”按钮自身的关闭路径：已由按钮语义处理过修改，关窗时不再弹三态询问
+    private bool _suppressClosePrompt;
+
+    #region TEMP-PERF // 临时性能埋点（仅 Stopwatch 计时与内存计数，不改任何业务行为）；验收后整块连同 grep TEMP-PERF 命中行一并删除
+    // 真机量测时把本字段（以及 TextBatchEditAction.PerfTrace）改为 true。用 static readonly 而非 const：
+    // const false 会让 if(PerfTrace){...} 被 C# 编译器判为不可达代码并报 CS0162（已实测，破坏 0 警告）；
+    // static readonly 不产生编译期常量假分支，关时每条守卫只是一次静态 bool 读取+短路（无 Stopwatch 调用/无分配/无拼串/无 IO），
+    // JIT 还可对只读静态字段做常量传播进一步消除。高频 CellFormatting 路径关时成本即这一次短路。
+    private static readonly bool PerfTrace = false; // TEMP-PERF 一键开关：真机量测时改 true
+    private long _perfCellFormattingCount;  // TEMP-PERF GridOnCellFormatting 累计调用次数（仅整数自增，绝不在高频路径拼串/打日志）
+    private long _perfLastCfCount;          // TEMP-PERF 上一个汇总窗的 CellFormatting 计数
+    private long _perfLastCfTicks;          // TEMP-PERF 上一个汇总窗的时间戳（Stopwatch.GetTimestamp）
+    private double _perfLastDirtyMs;        // TEMP-PERF 最近一次 DirtyRows() 耗时（ms，高分辨率）
+    private int _perfMeasureCount;          // TEMP-PERF 一次 AutoFitColumns 内 TextRenderer.MeasureText 调用次数
+    private long _perfInvZoom;              // TEMP-PERF Invalidate 来源计数：ZoomGrid（:128）
+    private long _perfInvFocusMove;         // TEMP-PERF Invalidate 来源计数：CurrentCellChanged 且聚焦开关开（:542）
+    private long _perfInvFocusToggle;       // TEMP-PERF Invalidate 来源计数：“单元格聚焦”开关切换（:804）
+    private long _perfInvSort;              // TEMP-PERF Invalidate 来源计数：ApplySort 末尾（:1751）
+    private long _perfInvUpdateApply;       // TEMP-PERF Invalidate 来源计数：UpdateApplyEnabled（:1811）
+
+    // TEMP-PERF 汇总自上一个汇总窗以来的 CellFormatting 次数与近似每秒次数，并重设窗；只在 if (PerfTrace) 内调用
+    private string PerfCfWindowReset() // TEMP-PERF
+    {
+        var now = Stopwatch.GetTimestamp();
+        var cnt = _perfCellFormattingCount;
+        var dCnt = cnt - _perfLastCfCount;
+        var dSec = (now - _perfLastCfTicks) / (double)Stopwatch.Frequency;
+        _perfLastCfCount = cnt;
+        _perfLastCfTicks = now;
+        return "CellFormatting 本窗=" + dCnt + "次 " + dSec.ToString("0.000") + "s ≈"
+            + (dSec > 0.0001 ? (dCnt / dSec).ToString("0") : "N/A") + "次/s 累计=" + cnt;
+    }
+
+    // TEMP-PERF 各 Invalidate 来源累计计数一行（只在汇总时拼串）
+    private string PerfInvString() => // TEMP-PERF
+        "Invalidate[缩放=" + _perfInvZoom + " 焦点移动=" + _perfInvFocusMove
+        + " 聚焦开关=" + _perfInvFocusToggle + " 排序=" + _perfInvSort
+        + " UpdateApply=" + _perfInvUpdateApply + "]";
+    #endregion
 
 
     // 双击列标题三级排序：默认(结构→X↑→Y↓) → 升 → 降 → 默认
@@ -72,6 +113,17 @@ public class TextBatchEditForm : Form
     private float _zoom = 1f;
     private const float ZoomMin = 0.7f, ZoomMax = 1.8f, ZoomStep = 0.1f;
 
+    private const int WM_SETREDRAW = 0x000B;
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
+
+    // 批量改网格前挂起重绘以消除闪烁；句柄未创建时跳过（首次布局阶段无需挂起）
+    private void SetGridRedraw(bool allow)
+    {
+        if (_grid.IsHandleCreated) { SendMessage(_grid.Handle, WM_SETREDRAW, allow ? (IntPtr)1 : IntPtr.Zero, IntPtr.Zero); }
+    }
+
     /// <summary>Ctrl+滚轮：以光标为中心整体缩放表格字体、列宽、行高（行号列宽随字体自适应）。</summary>
     private void ZoomGrid(bool zoomIn)
     {
@@ -83,25 +135,36 @@ public class TextBatchEditForm : Form
         _baseGridFont ??= _grid.Font; // 首次缩放时记录原始字体（不释放它）
         var ratio = newZoom / _zoom;
 
-        // 列宽、行高相对当前值按比例缩放（不缓存绝对值，重载/自适应后仍可继续缩放）
-        foreach (DataGridViewColumn col in _grid.Columns)
+        // 列宽/行高/字体三段布局改动期间挂起重绘，避免逐项缩放闪烁；恢复后整表失效一次统一重绘
+        try
         {
-            if (!col.Visible) { continue; }
-            col.Width = Math.Max(20, (int)Math.Round(col.Width * ratio));
+            SetGridRedraw(false);
+            // 列宽、行高相对当前值按比例缩放（不缓存绝对值，重载/自适应后仍可继续缩放）
+            foreach (DataGridViewColumn col in _grid.Columns)
+            {
+                if (!col.Visible) { continue; }
+                col.Width = Math.Max(20, (int)Math.Round(col.Width * ratio));
+            }
+            foreach (DataGridViewRow row in _grid.Rows)
+            {
+                row.Height = Math.Max(14, (int)Math.Round(row.Height * ratio));
+            }
+
+            // 字体按基准字体 × 因子重建（表头/编辑控件均继承 grid.Font）
+            var old = _appliedGridFont;
+            _appliedGridFont = new Font(_baseGridFont.FontFamily, _baseGridFont.Size * newZoom,
+                _baseGridFont.Style, _baseGridFont.Unit, _baseGridFont.GdiCharSet, _baseGridFont.GdiVerticalFont);
+            _grid.Font = _appliedGridFont;
+            old?.Dispose();
+
+            _zoom = newZoom;
         }
-        foreach (DataGridViewRow row in _grid.Rows)
+        finally
         {
-            row.Height = Math.Max(14, (int)Math.Round(row.Height * ratio));
+            SetGridRedraw(true);
         }
-
-        // 字体按基准字体 × 因子重建（表头/编辑控件均继承 grid.Font）
-        var old = _appliedGridFont;
-        _appliedGridFont = new Font(_baseGridFont.FontFamily, _baseGridFont.Size * newZoom,
-            _baseGridFont.Style, _baseGridFont.Unit, _baseGridFont.GdiCharSet, _baseGridFont.GdiVerticalFont);
-        _grid.Font = _appliedGridFont;
-        old?.Dispose();
-
-        _zoom = newZoom;
+        if (PerfTrace) { _perfInvZoom++; } // TEMP-PERF Invalidate 来源：Ctrl+滚轮缩放
+        _grid.Invalidate(true);
     }
 
 
@@ -194,6 +257,30 @@ public class TextBatchEditForm : Form
         Application.AddMessageFilter(_ctrlJFilter);
         // 窗体真正显示（grid 句柄已建）后：按两个开关初始化列可见性（内含一次自动列宽）
         Shown += (_, _) => UpdateColumnVisibility();
+    }
+
+    protected override void OnFormClosing(FormClosingEventArgs e)
+    {
+        // 仅拦截用户点 X / Alt+F4 / 系统菜单关闭；属主关闭、应用退出、关机、任务管理器结束等一律放行
+        if (e.CloseReason == CloseReason.UserClosing && !_suppressClosePrompt)
+        {
+            var dirtyRows = DirtyRows();
+            // IsCurrentCellDirty 覆盖“正在编辑还没离开该格”：编辑控件里的改动尚未提交进单元格值，DirtyRows() 暂时不计该行
+            var editRow = _grid.CurrentCell?.RowIndex ?? -1;
+            var uncommittedRow = _grid.IsCurrentCellDirty && editRow >= 0 && !dirtyRows.Contains(editRow);
+            if (dirtyRows.Count > 0 || uncommittedRow)
+            {
+                var dirtyCount = dirtyRows.Count + (uncommittedRow ? 1 : 0);
+                var ans = MessageBox.Show(
+                    "当前有 " + dirtyCount + " 处修改尚未保存。\n\n" +
+                    "“是”保存修改后关闭；\n“否”放弃未保存修改并关闭；\n“取消”返回继续编辑。",
+                    "文本批量编辑", MessageBoxButtons.YesNoCancel, MessageBoxIcon.Question);
+                if (ans == DialogResult.Cancel) { e.Cancel = true; }
+                else if (ans == DialogResult.No) { /* 放弃改动，直接放行（等同“取消”按钮语义） */ }
+                else if (!SaveDirty(quietSuccess: true)) { e.Cancel = true; } // 保存失败（如回读不一致）则留窗
+            }
+        }
+        base.OnFormClosing(e);
     }
 
     protected override void OnFormClosed(FormClosedEventArgs e)
@@ -491,8 +578,19 @@ public class TextBatchEditForm : Form
         _grid.CellFormatting += GridOnCellFormatting; // 统一单元格状态着色
         _grid.CurrentCellChanged += (_, _) =>
         {
-            if (_focusCellChk is { Checked: true }) { _grid.Invalidate(); }
-            UpdateApplyEnabled(); // 刷新底部状态：当前格为复选框时在状态区提示“双击修改”
+            var swPerfCell = PerfTrace ? Stopwatch.StartNew() : null; // TEMP-PERF 焦点移动一次总计
+            if (_focusCellChk is { Checked: true })
+            {
+                if (PerfTrace) { _perfInvFocusMove++; } // TEMP-PERF Invalidate 来源：焦点移动（仅聚焦开关开时实际调用）
+                _grid.Invalidate();
+            }
+            UpdateApplyEnabled(); // 刷新底部状态：当前格为复选框时在状态区提示“双击修改”（内含 DirtyRows 与一次 Invalidate）
+            if (PerfTrace)
+            {
+                swPerfCell!.Stop(); // TEMP-PERF
+                AddInLogger.Debug("PERF CurrentCellChanged: 总=" + swPerfCell.Elapsed.TotalMilliseconds.ToString("0.000") + "ms" // TEMP-PERF
+                    + " DirtyRows=" + _perfLastDirtyMs.ToString("0.000") + "ms " + PerfCfWindowReset() + " " + PerfInvString());
+            }
         };
         _grid.CellPainting += GridOnCellPainting;     // 自绘列头排序箭头
         // 行高拖拽交给 DataGridView 内置：分隔条只在行号（行首）列底边，数据列不响应
@@ -504,11 +602,17 @@ public class TextBatchEditForm : Form
             {
                 tb.TextChanged -= EditingTextChanged;
                 tb.TextChanged += EditingTextChanged;
+                // P2-b：进入新格文本编辑时重置自动保存计时，防抖锚点不得还挂在前一格；
+                // 提交后由 CellEndEdit/CellValueChanged/TextChanged 重新计时。
+                _autoSaveTimer?.Stop();
                 // 编辑态承载焦点的是内嵌文本框，默认用系统菜单（没有我们的“换行/转到图形”）；
                 // 显式挂专用菜单，保证编辑中右键也能插入 ¶、转到图形。
                 tb.ContextMenuStrip = BuildEditMenu(tb);
             }
         };
+        // 编辑结束（含 Esc 取消这类不触发 CellValueChanged 的路径）重新排一次，
+        // 闭合 EditingControlShowing 停表后“再也不保存”的可能。
+        _grid.CellEndEdit += (_, _) => ScheduleAutoSave();
         _grid.DataError += (_, e) =>
         {
             AddInLogger.Warn("网格 DataError: ctx=" + e.Context + " " + (e.Exception?.Message ?? ""));
@@ -747,7 +851,11 @@ public class TextBatchEditForm : Form
         _autoSaveChk.CheckedChanged += (_, _) => OnAutoSaveToggled();
 
         _focusCellChk = MakeToggle("单元格聚焦", 108, true); // 默认开启：当前格所在行/列浅底
-        _focusCellChk.CheckedChanged += (_, _) => _grid.Invalidate();
+        _focusCellChk.CheckedChanged += (_, _) =>
+        {
+            if (PerfTrace) { _perfInvFocusToggle++; } // TEMP-PERF Invalidate 来源：“单元格聚焦”开关切换
+            _grid.Invalidate();
+        };
 
         barFlow.Controls.Add(_autoSaveChk);   // 自动保存固定在所有开关最左
         barFlow.Controls.Add(_showOrigChk);
@@ -876,6 +984,8 @@ public class TextBatchEditForm : Form
     /// </summary>
     private void AutoFitColumns()
     {
+        var swPerfFit = PerfTrace ? Stopwatch.StartNew() : null; // TEMP-PERF 列宽总计
+        if (PerfTrace) { _perfMeasureCount = 0; } // TEMP-PERF 本次 MeasureText 调用计数清零（汇总一行，不逐次打日志）
         const int minW = 40, maxW = 420;
         const int pad = 8;           // 文字左右内边距合计
         const int arrowReserve = 18; // 仅当前排序列给排序箭头预留
@@ -894,6 +1004,7 @@ public class TextBatchEditForm : Form
             foreach (var line in (col.HeaderText ?? string.Empty).Split('\n'))
             {
                 best = Math.Max(best, TextRenderer.MeasureText(g, line, headFont, Size.Empty, flags).Width);
+                if (PerfTrace) { _perfMeasureCount++; } // TEMP-PERF 表头 MeasureText 计数
             }
 
             if (col is DataGridViewCheckBoxColumn)
@@ -908,7 +1019,9 @@ public class TextBatchEditForm : Form
                 if (string.IsNullOrEmpty(s)) { continue; }
                 foreach (var line in s!.Split('\n'))
                 {
-                    best = Math.Max(best, TextRenderer.MeasureText(g, line, cellFont, Size.Empty, flags).Width);
+                    var mwPerf = TextRenderer.MeasureText(g, line, cellFont, Size.Empty, flags).Width; // TEMP-PERF 旁：每次 MeasureText 都计
+                    if (PerfTrace) { _perfMeasureCount++; } // TEMP-PERF 数据格 MeasureText 计数（每次调用都计）
+                    best = Math.Max(best, mwPerf);
                 }
             }
 
@@ -916,6 +1029,13 @@ public class TextBatchEditForm : Form
             var arrow = col.Index == _sortCol ? arrowReserve : 0;
             var w = best + pad + arrow;
             col.Width = Math.Max(minW, Math.Min(maxW, w));
+        }
+        if (PerfTrace)
+        {
+            swPerfFit!.Stop(); // TEMP-PERF
+            AddInLogger.Debug("PERF AutoFitColumns: 总=" + swPerfFit.Elapsed.TotalMilliseconds.ToString("0.0") + "ms" // TEMP-PERF
+                + " MeasureText调用=" + _perfMeasureCount + "次 列数=" + _grid.Columns.Cast<DataGridViewColumn>().Count(c => c.Visible)
+                + " 行数=" + _grid.Rows.Count);
         }
         AddInLogger.Debug("AutoFitColumns 完成（含表头最长行 + 排序箭头余量）");
     }
@@ -1004,6 +1124,7 @@ public class TextBatchEditForm : Form
     // —— 单元格状态着色（只读灰 / 已改未保存黄 / 已改已保存绿 / 原值随已保存改动变蓝）——
     private void GridOnCellFormatting(object? sender, DataGridViewCellFormattingEventArgs e)
     {
+        if (PerfTrace) { _perfCellFormattingCount++; } // TEMP-PERF 高频路径：关时仅一次静态 bool 短路；开时仅整数自增（无 GetTimestamp/拼串/IO）
         var row = e.RowIndex;
         var col = e.ColumnIndex;
         if (row < 0 || row >= _baseline.Count) { return; }
@@ -1183,10 +1304,11 @@ public class TextBatchEditForm : Form
         };
 
         _okBtn = new Button { Text = "确定", Width = 90, Height = 30, Margin = new Padding(0, 6, 8, 0) };
-        _okBtn.Click += (_, _) => { if (SaveDirty(quietSuccess: true)) { Close(); } };
+        // 仅在 SaveDirty 成功、确实要关窗前置位：保存失败不关窗，守卫保持 false，下次 X 仍正常拦截
+        _okBtn.Click += (_, _) => { if (SaveDirty(quietSuccess: true)) { _suppressClosePrompt = true; Close(); } };
 
         _cancelBtn = new Button { Text = "取消", Width = 90, Height = 30, Margin = new Padding(0, 6, 8, 0) };
-        _cancelBtn.Click += (_, _) => Close();
+        _cancelBtn.Click += (_, _) => { _suppressClosePrompt = true; Close(); };
 
         _applyBtn = new Button { Text = "应用", Width = 90, Height = 30, Margin = new Padding(0, 6, 12, 0) };
         _applyBtn.Click += (_, _) => SaveDirty(quietSuccess: true);
@@ -1437,12 +1559,21 @@ public class TextBatchEditForm : Form
             + " 项目语言=[" + string.Join(",", _projectLangs.Select(LangHelper.Code)) + "] 源语言=" + _sourceLang);
         var unknown = ISOCode.Language.L___;
 
+        var swPerfLoad = PerfTrace ? Stopwatch.StartNew() : null; // TEMP-PERF 装载总计
+        if (PerfTrace) { _perfLastCfTicks = Stopwatch.GetTimestamp(); _perfLastCfCount = _perfCellFormattingCount; } // TEMP-PERF 装载计数窗基线
+        Stopwatch? swPerfRank = null; // TEMP-PERF BuildRankMaps
+        Stopwatch? swPerfRead = null; // TEMP-PERF EPLAN 读对象段累计（Contents/语言列表/meta）
+        Stopwatch? swPerfGrid = null; // TEMP-PERF Rows.Add+赋格段累计
+        if (PerfTrace) { swPerfRead = new Stopwatch(); swPerfGrid = new Stopwatch(); } // TEMP-PERF
+
         _baseline.Clear();
         _initial.Clear();
         _stash.Clear();
         _origIndex.Clear();
         _meta.Clear();
+        if (PerfTrace) { swPerfRank = Stopwatch.StartNew(); } // TEMP-PERF
         BuildRankMaps();
+        if (PerfTrace) { swPerfRank!.Stop(); } // TEMP-PERF
         _syncing = true;
         _grid.Rows.Clear();
         try
@@ -1458,6 +1589,7 @@ public class TextBatchEditForm : Form
 
                 try
                 {
+                    if (PerfTrace) { swPerfGrid!.Stop(); swPerfRead!.Start(); } // TEMP-PERF 下一轮读段起：先封口上一轮赋格表（首轮 grid 未运行，Stop 为安全 no-op），再启读段，保证两段严格互斥
                     var c = t.Contents;
                     var langs = new LanguageList();
                     c.GetLanguageList(ref langs);
@@ -1501,7 +1633,9 @@ public class TextBatchEditForm : Form
                 {
                     AddInLogger.Error("读取对象 " + i + " 文本失败", ex);
                 }
+                if (PerfTrace) { swPerfRead!.Stop(); } // TEMP-PERF EPLAN 读对象段（Contents）结束
 
+                if (PerfTrace) { swPerfGrid!.Start(); } // TEMP-PERF Rows.Add+赋格段开始
                 var rowIdx = _grid.Rows.Add();
                 var row = _grid.Rows[rowIdx];
                 row.Cells[ColIndex].Value = (i + 1).ToString(); // 临时值，ApplyDefaultOrder 后被固定排名覆盖
@@ -1509,7 +1643,9 @@ public class TextBatchEditForm : Form
                 row.Cells[ColType].Value = typeName;
 
                 // 只读结构/坐标信息（坐标排序用原始 double，显示保留 1 位小数）
+                if (PerfTrace) { swPerfGrid!.Stop(); swPerfRead!.Start(); } // TEMP-PERF BuildMeta 走 EPLAN 读段
                 var meta = BuildMeta(t);
+                if (PerfTrace) { swPerfRead!.Stop(); swPerfGrid!.Start(); } // TEMP-PERF BuildMeta 结束，回到入表段
                 row.Cells[ColPage].Value = meta.PageName;
                 row.Cells[ColPlant].Value = meta.Plant;
                 row.Cells[ColPlace].Value = meta.Place;
@@ -1558,6 +1694,15 @@ public class TextBatchEditForm : Form
         {
             _syncing = false;
         }
+        if (PerfTrace)
+        {
+            swPerfGrid!.Stop(); // TEMP-PERF 封口最后一行的赋格段（running 时读 Elapsed 本合法，Stop 仅为语义干净/两段互斥）
+            swPerfLoad!.Stop(); // TEMP-PERF
+            AddInLogger.Debug("PERF LoadRows: 总=" + swPerfLoad.Elapsed.TotalMilliseconds.ToString("0.0") + "ms n=" + _texts.Count // TEMP-PERF
+                + " EPLAN读对象段(Contents/meta)=" + swPerfRead!.Elapsed.TotalMilliseconds.ToString("0.0") + "ms"
+                + " Rows.Add+赋格段=" + swPerfGrid!.Elapsed.TotalMilliseconds.ToString("0.0") + "ms"
+                + " BuildRankMaps=" + swPerfRank!.Elapsed.TotalMilliseconds.ToString("0.0") + "ms " + PerfCfWindowReset());
+        }
     }
 
     // —— 双击列标题：顺序 → 倒序 → 默认（恢复开窗原始顺序）——
@@ -1585,6 +1730,7 @@ public class TextBatchEditForm : Form
 
     private void ApplySort(int col, int dir)
     {
+        var swPerfSort = PerfTrace ? Stopwatch.StartNew() : null; // TEMP-PERF 排序总计（含方法首句 EndEdit 到 Refresh 返回）
         if (_grid.IsCurrentCellInEditMode) { _grid.EndEdit(); }
         var n = _grid.Rows.Count;
         if (n == 0) { return; }
@@ -1669,6 +1815,7 @@ public class TextBatchEditForm : Form
         _syncing = true;
         try
         {
+            SetGridRedraw(false); // 批量重建期间挂起重绘消除闪烁；finally 中务必与 _syncing 一并恢复
             _grid.Rows.Clear();
             var ri = 0;
             foreach (var v in sorted)
@@ -1687,14 +1834,22 @@ public class TextBatchEditForm : Form
         finally
         {
             _syncing = false;
+            SetGridRedraw(true);
         }
 
         // 触发列头重绘，由 CellPainting 在当前排序列表头叠加箭头字符
         _grid.AutoResizeRowHeadersWidth(DataGridViewRowHeadersWidthSizeMode.AutoSizeToAllHeaders); // 行号位数变化时列宽跟随
+        if (PerfTrace) { _perfInvSort++; } // TEMP-PERF Invalidate 来源：ApplySort
         _grid.Invalidate(_grid.DisplayRectangle);
-        _grid.Refresh();
+        _grid.Refresh(); // 同步重绘：返回到此处可见区单元格基本已绘制（CellFormatting 已完成）
 
         UpdateApplyEnabled();
+        if (PerfTrace)
+        {
+            swPerfSort!.Stop(); // TEMP-PERF
+            AddInLogger.Debug("PERF ApplySort: 总=" + swPerfSort.Elapsed.TotalMilliseconds.ToString("0.0") + "ms" // TEMP-PERF
+                + " 列=" + col + " dir=" + dir + " n=" + n + " " + PerfCfWindowReset() + " " + PerfInvString());
+        }
         AddInLogger.Debug("排序：列=" + col + " 方向=" + (dir == 0 ? "默认(结构→X↑→Y↓)" : dir > 0 ? "升序" : "降序"));
     }
 
@@ -1748,10 +1903,16 @@ public class TextBatchEditForm : Form
 
     private void UpdateApplyEnabled()
     {
+        var swPerfDirty = PerfTrace ? Stopwatch.StartNew() : null; // TEMP-PERF DirtyRows 全表扫描
         var dirty = DirtyRows().Count;
+        if (PerfTrace) { swPerfDirty!.Stop(); _perfLastDirtyMs = swPerfDirty.Elapsed.TotalMilliseconds; } // TEMP-PERF
         if (_applyBtn != null) { _applyBtn.Enabled = dirty > 0; }
         UpdateStatus(dirty);
-        if (_grid != null) { _grid.Invalidate(); } // 触发 CellFormatting 重算脏/已保存底色
+        if (_grid != null)
+        {
+            if (PerfTrace) { _perfInvUpdateApply++; } // TEMP-PERF Invalidate 来源：UpdateApplyEnabled
+            _grid.Invalidate(); // 触发 CellFormatting 重算脏/已保存底色
+        }
     }
 
     /// <summary>底部左侧状态提示：未保存数量 / 全部已保存 / 自动保存状态；当前格在复选框列时附加“双击修改”。</summary>
@@ -1791,6 +1952,13 @@ public class TextBatchEditForm : Form
         UpdateApplyEnabled();
     }
 
+    /// <summary>当前格正处于文本编辑（承载焦点的 TextBoxBase 编辑控件已就位）。
+    /// 自动保存遇到此状态本轮跳过：既不保存也不 EndEdit，避免打断用户正在编辑的格子。</summary>
+    private bool IsCurrentTextCellEditing() =>
+        _grid.IsCurrentCellInEditMode
+        && _grid.EditingControl is TextBoxBase tb
+        && tb.Focused;
+
     private void ScheduleAutoSave()
     {
         if (_saving || _autoSaveChk == null || !_autoSaveChk.Checked) { return; }
@@ -1802,12 +1970,19 @@ public class TextBatchEditForm : Form
             {
                 _autoSaveTimer.Stop();
                 if (IsDisposed || _saving || _autoSaveChk == null || !_autoSaveChk.Checked) { return; }
+                // P2-b 守卫：当前格仍在文本编辑时本轮不保存、不 EndEdit，重启防抖稍后重试；
+                // 用户提交该格后由 CellEndEdit/CellValueChanged/TextChanged 自然再调度，保证脏数据最终落库。
+                if (IsCurrentTextCellEditing())
+                {
+                    _autoSaveTimer.Start();
+                    return;
+                }
                 if (DirtyRows().Count == 0) { return; }
                 _saving = true;
                 try
                 {
                     AddInLogger.Debug("自动保存触发");
-                    SaveDirty(quietSuccess: true);
+                    SaveDirty(quietSuccess: true, commitCurrentEdit: false);
                 }
                 finally
                 {
@@ -1827,7 +2002,7 @@ public class TextBatchEditForm : Form
     private void EditingTextChanged(object? sender, EventArgs e)
     {
         if (_applyBtn is { Enabled: false }) { _applyBtn.Enabled = true; }
-        ScheduleAutoSave(); // 当前格未提交也计时；SaveDirty 开头会先 EndEdit 提交
+        ScheduleAutoSave(); // 编辑中每键仅重置防抖；到点时若仍在编辑，Tick 守卫会跳过本轮而不打断输入
     }
 
     /// <summary>
@@ -2265,15 +2440,30 @@ public class TextBatchEditForm : Form
     /// 增量保存：无脏行直接返回成功且不建撤销点；有脏行才开启一个 UndoStep+Transaction，
     /// 只写脏对象、且只动变化的字段（Contents / IsAutomaticallyTranslated）。确定与应用共用本方法。
     /// </summary>
+    /// <param name="commitCurrentEdit">true（默认，手动“应用/确定”、刷新选择集等显式路径）先提交当前编辑格，保证“最后一格未离开也能保存”；
+    /// false（仅自动保存）：不 EndEdit 当前格，调用方已先做编辑态守卫，只写已提交的脏行。</param>
     /// <returns>true=可关窗（无修改或写回并校验一致）；false=异常或回读不一致，保留窗口。</returns>
-    private bool SaveDirty(bool quietSuccess = false)
+    private bool SaveDirty(bool quietSuccess = false, bool commitCurrentEdit = true)
     {
-        // 先结束正在进行的单元格编辑，避免最后一格输入未提交
-        if (_grid.IsCurrentCellInEditMode) { _grid.EndEdit(); }
+        var swPerfSave = PerfTrace ? Stopwatch.StartNew() : null;   // TEMP-PERF 保存总计
+        var swPerfCommit = PerfTrace ? Stopwatch.StartNew() : null; // TEMP-PERF 段1 提交当前格（不含 EndEdit 时仅一帧，结合编辑态标志解读）
+        var swPerfTxn = PerfTrace ? new Stopwatch() : null;         // TEMP-PERF 段2 写回事务（UndoStep+Transaction 到 Close/Dispose）
+        var swPerfRb = PerfTrace ? new Stopwatch() : null;          // TEMP-PERF 段3 回读校验
+        var perfEditingOnEntry = PerfTrace && _grid.IsCurrentCellInEditMode; // TEMP-PERF 进入 SaveDirty 时当前格是否在编辑（P2-b 观测点）
+        var perfLangCmp = 0; // TEMP-PERF 回读段逐语言比对次数
+        // 先结束正在进行的单元格编辑，避免最后一格输入未提交（仅显式保存路径；自动保存路径不打断编辑）
+        if (commitCurrentEdit && _grid.IsCurrentCellInEditMode) { _grid.EndEdit(); }
+        if (PerfTrace) { swPerfCommit!.Stop(); } // TEMP-PERF
 
         var dirty = DirtyRows();
         if (dirty.Count == 0)
         {
+            if (PerfTrace) // TEMP-PERF 无脏行早退汇总（未开事务，段2/段3为 0）
+            {
+                AddInLogger.Debug("PERF SaveDirty: 总=" + swPerfSave!.Elapsed.TotalMilliseconds.ToString("0.000") + "ms 脏行=0"
+                    + " 进入时编辑态=" + perfEditingOnEntry + " commitCurrentEdit=" + commitCurrentEdit
+                    + " 提交当前格=" + swPerfCommit!.Elapsed.TotalMilliseconds.ToString("0.000") + "ms 写回事务=0ms 回读=0ms 语言比对=0");
+            }
             AddInLogger.Info("SaveDirty: 无未保存修改，跳过写回（不产生撤销点）");
             return true;
         }
@@ -2285,8 +2475,22 @@ public class TextBatchEditForm : Form
         UndoStep? undo = null;
         Transaction? txn = null;
         var written = new List<int>();
+
+        void PerfLogDirtySave() // TEMP-PERF 脏行路径统一汇总（本地函数，仅在 if(PerfTrace) 内调用，不改变控制流/异常路径）
+        {
+            swPerfSave!.Stop();
+            AddInLogger.Debug("PERF SaveDirty: 总=" + swPerfSave.Elapsed.TotalMilliseconds.ToString("0.000") + "ms"
+                + " 脏行=" + dirty.Count + " 实际写回=" + written.Count
+                + " 进入时编辑态=" + perfEditingOnEntry + " commitCurrentEdit=" + commitCurrentEdit
+                + " 提交当前格=" + swPerfCommit!.Elapsed.TotalMilliseconds.ToString("0.000") + "ms"
+                + " 写回事务=" + swPerfTxn!.Elapsed.TotalMilliseconds.ToString("0.000") + "ms"
+                + " 回读校验=" + swPerfRb!.Elapsed.TotalMilliseconds.ToString("0.000") + "ms"
+                + " 回读语言比对=" + perfLangCmp + "次");
+        }
+
         try
         {
+            if (PerfTrace) { swPerfTxn!.Start(); } // TEMP-PERF 段2 起：UndoStep+Transaction+逐脏写回到 Close
             undo = new UndoManager().CreateUndoStep();
             undo.SetUndoDescription("文本批量编辑");
             txn = new TransactionManager().CreateTransaction();
@@ -2357,6 +2561,7 @@ public class TextBatchEditForm : Form
             undo.CloseOpenUndo();
             undo.Dispose();
             undo = null;
+            if (PerfTrace) { swPerfTxn!.Stop(); swPerfRb!.Start(); } // TEMP-PERF 段2止、段3起：回读校验
 
             // 回读校验：仅校验本次脏行
             foreach (var i in dirty)
@@ -2382,6 +2587,7 @@ public class TextBatchEditForm : Form
                     {
                         var want = _grid[_newLangCol[lang], i].Value as string ?? string.Empty;
                         var actual = ToGrid(ReadSafe(c, lang)); // 真实换行 → ¶ 再比对
+                        if (PerfTrace) { perfLangCmp++; } // TEMP-PERF 回读逐语言比对计数
                         if (!string.Equals(want, actual, StringComparison.Ordinal))
                         {
                             rowOk = false;
@@ -2404,6 +2610,7 @@ public class TextBatchEditForm : Form
                 }
                 if (!rowOk) { mismatchRows.Add(i + 1); }
             }
+            if (PerfTrace) { swPerfRb!.Stop(); } // TEMP-PERF 段3止：回读 foreach 结束（后续基线刷新/UpdateApplyEnabled 不计入回读段）
 
             if (mismatchRows.Count > 0)
             {
@@ -2417,6 +2624,7 @@ public class TextBatchEditForm : Form
                     if (!mismatchRows.Contains(i + 1)) { _baseline[i] = SnapshotRow(i); }
                 }
                 UpdateApplyEnabled();
+                if (PerfTrace) { PerfLogDirtySave(); } // TEMP-PERF 回读不一致路径
                 return false;
             }
 
@@ -2425,6 +2633,7 @@ public class TextBatchEditForm : Form
             UpdateApplyEnabled();
 
             AddInLogger.Info("SaveDirty: 成功 写回行=[" + string.Join(",", written) + "]，合并为 1 个撤销点");
+            if (PerfTrace) { PerfLogDirtySave(); } // TEMP-PERF 成功路径
             if (!quietSuccess)
             {
                 MessageBox.Show("已写回 " + written.Count + " 个文本对象（一个撤销点，可 Ctrl+Z 撤销）。",
@@ -2434,6 +2643,7 @@ public class TextBatchEditForm : Form
         }
         catch (Exception ex)
         {
+            if (PerfTrace) { PerfLogDirtySave(); } // TEMP-PERF 异常路径（段2可能仍在计时，Elapsed 反映到异常点；原异常继续抛出/处理路径不变）
             AddInLogger.Error("SaveDirty 异常，尝试中止事务", ex);
             try { txn?.Abort(); } catch (Exception abortEx) { AddInLogger.Error("事务 Abort 失败", abortEx); }
             MessageBox.Show("写回失败：" + ex.Message, "文本批量编辑",
@@ -2489,6 +2699,8 @@ public class TextBatchEditForm : Form
     /// </summary>
     private sealed class EditGrid : DataGridView
     {
+        public EditGrid() { DoubleBuffered = true; }
+
         public Action<Keys>? GridClipboardCommand;
         public Func<bool>? IsGridEditing;
         public Action<bool>? ZoomGrid; // 参数：true=放大，false=缩小
@@ -2576,9 +2788,14 @@ public class TextBatchEditForm : Form
 
         public override bool EditingControlWantsInputKey(Keys keyData, bool dataGridViewWantsInputKey)
         {
+            var key = keyData & Keys.KeyCode;
             if ((keyData & Keys.KeyCode) == Keys.Enter && (keyData & Keys.Control) != 0)
             {
                 return true; // 自己消费 Ctrl+Enter
+            }
+            if (key == Keys.Home || key == Keys.End)
+            {
+                return true; // 双击全选时 Home/End 也留在文本内移动光标（Shift 选择到首/尾、Ctrl 文档首/尾），不让位 grid 跳行
             }
             return base.EditingControlWantsInputKey(keyData, dataGridViewWantsInputKey);
         }
