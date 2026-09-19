@@ -45,6 +45,7 @@ using Eplan.EplApi.DataModel.Graphics;
 using Eplan.EplApi.Gui;
 using Eplan.EplApi.HEServices;
 using Eplan.EplApi.Scripting;
+using Label = System.Windows.Forms.Label;
 
 namespace TbeThreadProbe
 {
@@ -56,7 +57,7 @@ namespace TbeThreadProbe
         public bool OnUnregister() { return true; }
         public bool OnInitGui()
         {
-            try { new Menu().AddMenuItem("TBE Thread Probe", ProbeAction.ActionName); }
+            try { new Eplan.EplApi.Gui.Menu().AddMenuItem("TBE Thread Probe", ProbeAction.ActionName); }
             catch (Exception ex) { Log("OnInitGui menu failed: " + ex); }
             return true;
         }
@@ -246,7 +247,7 @@ namespace TbeThreadProbe
 
         private static ReadResult ReadOnCurrentThread(TextBase[] texts, int n)
         {
-            var r = new ResultWithThreadInfo();
+            var r = new ReadResult();
             r.ThreadInfo = "managedId=" + Thread.CurrentThread.ManagedThreadId +
                            " apartment=" + Thread.CurrentThread.GetApartmentState();
             try
@@ -264,15 +265,12 @@ namespace TbeThreadProbe
             for (var i = 0; i < n; i++)
             {
                 r.Rows.Add(ReadOne(texts[i]));
-                if (i > 0 && i % 500 == 0) Log("...read " + i + "/" + n);
+                if (i > 0 && i % 500 == 0) TbeThreadProbeAddIn.Log("...read " + i + "/" + n);
             }
             sw.Stop();
             r.Ms = sw.ElapsedMilliseconds;
             return r;
         }
-
-        // Small adapter so the initializer above can set the thread metadata too.
-        private sealed class ResultWithThreadInfo : ReadResult { }
 
         private async Task RunAsync()
         {
@@ -331,7 +329,7 @@ namespace TbeThreadProbe
                     var bg = await Task.Run(() =>
                     {
                         var rr = ReadOnCurrentThread(texts, n);
-                        Log("background round " + roundNo + " done");
+                        TbeThreadProbeAddIn.Log("background round " + roundNo + " done");
                         return rr;
                     });
                     bgRounds.Add(bg);
@@ -364,7 +362,7 @@ namespace TbeThreadProbe
                             .First(m => m.Name == "ExecuteInMainThreadSync"
                                         && m.GetParameters().Length == 2);
                         var delType = mi.GetParameters()[0].ParameterType;
-                        Log("ExecuteInMainThreadSync picked overload: " + mi + " delegate=" + delType);
+                        TbeThreadProbeAddIn.Log("ExecuteInMainThreadSync picked overload: " + mi + " delegate=" + delType);
                         Func<object, object> body = o =>
                         {
                             var tt = texts[Convert.ToInt32(o) % texts.Length];

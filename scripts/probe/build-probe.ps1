@@ -94,6 +94,8 @@ if (Test-Path $fxDir) {
 }
 
 $cscArgs = @(
+    "/noconfig",
+    "/nostdlib+",
     "/nologo", "/target:library", "/platform:x64",
     "/out:`"$outDll`""
 )
