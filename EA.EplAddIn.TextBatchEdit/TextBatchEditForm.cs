@@ -7,6 +7,8 @@ using System.Diagnostics; // TEMP-PERF
 using System.Drawing;
 using System.Linq;
 using System.Runtime.InteropServices;
+using System.Threading;
+using System.Threading.Tasks;
 using System.Windows.Forms;
 
 namespace EA.EplAddIn.TextBatchEdit;
@@ -40,6 +42,7 @@ public class TextBatchEditForm : Form
     private static readonly System.Drawing.Color FocusHeaderTint = System.Drawing.Color.FromArgb(217, 235, 248); // 单元格聚焦：列头/行首用略深浅蓝（在灰底上仍可辨）
 
     private EditGrid _grid = null!;
+    private TabControl _tabs = null!; // P1：加载期整体禁用标签页（含顶部开关条）
     private CheckBox _showOrigChk = null!;
     private CheckBox _showSrcChk = null!;
     private CheckBox _showStructChk = null!;
@@ -53,8 +56,15 @@ public class TextBatchEditForm : Form
     private CtrlEnterFilter? _keyFilter;
     private ClipboardKeyFilter? _clipFilter;
     private CtrlJFilter? _ctrlJFilter;
-    private Timer? _autoSaveTimer;
+    // 全限定：新增 using System.Threading 后，裸 Timer 会与 System.Threading.Timer 产生 CS0104 歧义
+    private System.Windows.Forms.Timer? _autoSaveTimer;
     private bool _saving; // 抑制保存/刷新过程中自动保存的重入
+    // P1 分块装载：_loading 期间挂住自动保存上档/关窗三态/Reload 重入；cts 供遮罩“取消”在块边界生效。
+    // 初始开窗装载取消=直接关窗；Reload 装载取消=保留旧表（见 LoadRowsChunkedAsync）。
+    private bool _loading;
+    private bool _formIsClosing; // OnFormClosing 一旦进入即为 true（含加载态关窗），供装载续体判断勿再 Close/触表
+    private CancellationTokenSource? _loadCts;
+    private LoadingOverlay? _loadingOverlay;
     // “确定/取消”按钮自身的关闭路径：已由按钮语义处理过修改，关窗时不再弹三态询问
     private bool _suppressClosePrompt;
 
@@ -271,8 +281,9 @@ public class TextBatchEditForm : Form
         BuildGrid();
         BuildTabs();
         BuildBottomBar();
-        LoadRows(); // P0-3：装载即按默认序一次性建行（结构标识符管理顺序 → X↑ → Y↓），不再随后二次 ApplyDefaultOrder
-        UpdateApplyEnabled();
+        // P1 Step1：构造函数不再同步 LoadRows——空窗（空表列结构 + 加载遮罩）先 Show，Shown 后分块异步装载。
+        // UpdateApplyEnabled 移到装载完成收尾；列可见性/列头行高仍在 Shown 初始化（空表上跑，P0 采样列宽对 0 行安全）。
+        BuildLoadingOverlay();
         // 应用层消息过滤器：在消息派发前吞掉编辑态的 Ctrl+Enter，防止被 DataGridView 当成“结束编辑”
         _keyFilter = new CtrlEnterFilter(this);
         Application.AddMessageFilter(_keyFilter);
@@ -281,8 +292,9 @@ public class TextBatchEditForm : Form
         _ctrlJFilter = new CtrlJFilter(this);
         Application.AddMessageFilter(_ctrlJFilter);
         // 窗体真正显示（grid 句柄已建）后：按两个开关初始化列可见性（内含一次自动列宽）；
-        // 列宽定稿后仅首次做一次列头行高自适应，锁定双行标题默认高度（EnableResizing 后不再自动跟随）
-        Shown += (_, _) =>
+        // 列宽定稿后仅首次做一次列头行高自适应，锁定双行标题默认高度（EnableResizing 后不再自动跟随）；
+        // 随后启动分块异步装载（await 期间窗已可见，遮罩展示进度/取消）。
+        Shown += async (_, _) =>
         {
             UpdateColumnVisibility();
             if (!_columnHeadersHeightInitialized)
@@ -290,11 +302,24 @@ public class TextBatchEditForm : Form
                 _columnHeadersHeightInitialized = true;
                 _grid.AutoResizeColumnHeadersHeight();
             }
+            await LoadRowsChunkedAsync(initial: true);
         };
     }
 
     protected override void OnFormClosing(FormClosingEventArgs e)
     {
+        // P1：加载态关窗（X/Alt+F4/确定/取消一律如此）——不弹三态：此时不允许保存路径打断装载，
+        // 置取消请求后放行关窗，装载续体在下一块边界感知取消并走清理（initial=空窗；reload 旧表随关窗丢弃）。
+        if (_loading)
+        {
+            if (e.CloseReason == CloseReason.UserClosing)
+            {
+                try { _loadCts?.Cancel(); } catch (ObjectDisposedException) { /* cts 已随收尾释放 */ }
+            }
+            _formIsClosing = true; // 关窗未被拦截（加载态不弹三态），通知装载续体勿再提交/触表
+            base.OnFormClosing(e);
+            return;
+        }
         // 仅拦截用户点 X / Alt+F4 / 系统菜单关闭；属主关闭、应用退出、关机、任务管理器结束等一律放行
         if (e.CloseReason == CloseReason.UserClosing && !_suppressClosePrompt)
         {
@@ -319,6 +344,8 @@ public class TextBatchEditForm : Form
 
     protected override void OnFormClosed(FormClosedEventArgs e)
     {
+        // 装载仍在跑（理论上 OnFormClosing 已在块边界前请求取消）：兜底取消并释放，杜绝残留定时器/遮罩/令牌
+        try { _loadCts?.Cancel(); } catch (ObjectDisposedException) { /* 已释放 */ }
         DisposeAutoSaveTimer();
         if (_keyFilter != null) { Application.RemoveMessageFilter(_keyFilter); _keyFilter = null; }
         if (_clipFilter != null) { Application.RemoveMessageFilter(_clipFilter); _clipFilter = null; }
@@ -856,6 +883,7 @@ public class TextBatchEditForm : Form
     private void BuildTabs()
     {
         var tabs = new TabControl { Dock = DockStyle.Fill };
+        _tabs = tabs;
 
         // 标签页 1：编辑（顶部开关 + 表格）
         var tabEdit = new TabPage("编辑");
@@ -1383,20 +1411,73 @@ public class TextBatchEditForm : Form
     }
 
     /// <summary>
+    /// P1：构建加载遮罩（默认隐藏）。以 Fill 停靠并置于 z-order 最顶——不可见时不参与停靠布局；
+    /// Show 时 BringToFront 保持最顶 z-order，停靠在底栏之上的整个标签区（遮罩本身拦截对 grid/开关条的鼠标）。
+    /// </summary>
+    private void BuildLoadingOverlay()
+    {
+        _loadingOverlay = new LoadingOverlay(() =>
+        {
+            try { _loadCts?.Cancel(); } catch (ObjectDisposedException) { /* 已释放 */ }
+        });
+        Controls.Add(_loadingOverlay);
+        Controls.SetChildIndex(_loadingOverlay, 0); // 最顶 z-order：停靠布局最后处理，Fill 只占底栏以外区域
+        _loadingOverlay.Visible = false;
+    }
+
+    private void ShowLoadingOverlay(int total)
+    {
+        if (_loadingOverlay == null) { return; }
+        _loadingOverlay.Begin(total);
+        _loadingOverlay.BringToFront(); // 显示前置顶：保证盖住标签区且不被后续控件遮挡
+        _loadingOverlay.Visible = true;
+    }
+
+    private void UpdateLoadingOverlay(int done, int total)
+    {
+        _loadingOverlay?.ReportProgress(done, total);
+    }
+
+    private void HideLoadingOverlay()
+    {
+        if (_loadingOverlay != null) { _loadingOverlay.Visible = false; }
+    }
+
+    /// <summary>加载期禁用/恢复交互：标签页（含全部开关）、确定/取消按钮、grid（杜绝快捷键/右键在遮罩下命中旧表）。
+    /// “应用”按钮启用态不在此恢复——由装载提交段或取消保留旧表后的 UpdateApplyEnabled 按脏行统一重算，避免被无条件置可用。</summary>
+    private void SetLoadingInputEnabled(bool enabled)
+    {
+        _tabs.Enabled = enabled;
+        _grid.Enabled = enabled;
+        if (!enabled)
+        {
+            if (_okBtn != null) { _okBtn.Enabled = false; }
+            if (_cancelBtn != null) { _cancelBtn.Enabled = false; }
+            if (_applyBtn != null) { _applyBtn.Enabled = false; }
+        }
+        else
+        {
+            if (_okBtn != null) { _okBtn.Enabled = true; }
+            if (_cancelBtn != null) { _cancelBtn.Enabled = true; }
+            // _applyBtn 交调用方按脏行重算
+        }
+    }
+
+    /// <summary>
     /// 为高层代号/安装地点/位置代号三段分别建立“结构标识符管理”顶层顺序表。
     /// 顶层节点（无父节点）即页“主标识符”可选取值，按其在管理对话框中的 SortId 升序编号。
     /// </summary>
-    private void BuildRankMaps()
+    private void BuildRankMaps(Project? project)
     {
         _plantRank.Clear();
         _placeRank.Clear();
         _locationRank.Clear();
-        if (_project == null) { return; }
+        if (project == null) { return; }
         try
         {
-            FillRank(_project, Project.Hierarchy.Plant, _plantRank);
-            FillRank(_project, Project.Hierarchy.Place, _placeRank);
-            FillRank(_project, Project.Hierarchy.Location, _locationRank);
+            FillRank(project, Project.Hierarchy.Plant, _plantRank);
+            FillRank(project, Project.Hierarchy.Place, _placeRank);
+            FillRank(project, Project.Hierarchy.Location, _locationRank);
         }
         catch (Exception ex)
         {
@@ -1550,12 +1631,20 @@ public class TextBatchEditForm : Form
     /// <summary>
     /// 窗口已常驻时，用最新选择集刷新表格行。选择集未变化则什么都不做；
     /// 存在未保存修改时弹窗询问（保存并刷新/丢弃刷新/取消）。语言集合或项目变化时连列一起重建。
-    /// 返回 true 表示已刷新，false 表示用户取消或选择未变化。
+    /// P1：async void——脏检查/同集判断等准备仍在本调用内同步完成（基于旧表，任何提前 return 都不碰旧表），
+    /// 随后分块异步装载；字段切换/网格清空统一推迟到“读完之后的同步提交段”，故读段取消=旧表完整保留。
+    /// 调用点（Action）不依赖刷新完成；加载期 UI 已禁用，重入由 _loading 双保险挡回。
     /// </summary>
-    public bool ReloadSelection(List<TextBase> texts, ISOCode.Language sourceLang,
+    public async void ReloadSelection(List<TextBase> texts, ISOCode.Language sourceLang,
         List<ISOCode.Language> projectLangs, Project? project)
     {
-        if (texts.Count == 0) { return false; }
+        if (texts.Count == 0) { return; }
+        if (_loading)
+        {
+            // P1：上一轮分块装载未完成，拒绝重入（加载期标签/按钮已禁用，正常不会走到这里）
+            AddInLogger.Debug("ReloadSelection：装载进行中，忽略本次刷新请求");
+            return;
+        }
 
         // 选择集是否与当前相同：同一项目（按项目链接完整路径）+ 同样的对象 DBID 顺序
         var newProjectKey = SafeProjectKey(project);
@@ -1565,9 +1654,9 @@ public class TextBatchEditForm : Form
             && texts.Count == _texts.Count
             && texts.Select(tx => tx.DatabaseIdentifier)
                     .SequenceEqual(_texts.Select(tx => tx.DatabaseIdentifier));
-        if (sameTexts) { return false; }
+        if (sameTexts) { return; }
 
-        // 有未保存修改：先问怎么办
+        // 有未保存修改：先问怎么办（此时旧表完好，取消/保存失败都原样返回）
         if (_grid.IsCurrentCellInEditMode) { _grid.EndEdit(); }
         var dirtyCount = DirtyRows().Count;
         if (dirtyCount > 0)
@@ -1576,231 +1665,394 @@ public class TextBatchEditForm : Form
                 "当前有 " + dirtyCount + " 处修改尚未保存。\n\n" +
                 "“是”保存这些修改后用新选择刷新；\n“否”放弃未保存修改并刷新；\n“取消”保持现状。",
                 "文本批量编辑", MessageBoxButtons.YesNoCancel, MessageBoxIcon.Question);
-            if (ans == DialogResult.Cancel) { return false; }
-            if (ans == DialogResult.Yes && !SaveDirty(quietSuccess: true)) { return false; } // 保存失败（如回读不一致）则中止
+            if (ans == DialogResult.Cancel) { return; }
+            if (ans == DialogResult.Yes && !SaveDirty(quietSuccess: true)) { return; } // 保存失败（如回读不一致）则中止
         }
 
-        // 项目或语言集合变化 → 连列结构一起重建；否则只重建行
+        // 语言集合是否变化（基于切换前的旧 _projectLangs）；列结构重建推迟到提交段（旧行清空之后）
         var langChanged = projectLangs.Count != _projectLangs.Count || projectLangs.Except(_projectLangs).Any();
-        _texts = texts;
-        _project = project;
-        _sourceLang = sourceLang;
-        _projectLangs = projectLangs;
-        Text = "文本批量编辑（源语言：" + LangHelper.Code(sourceLang) + "，共 " + texts.Count + " 个文本）";
 
-        DisposeAutoSaveTimer();
-        if (langChanged)
-        {
-            BuildColumns();
-        }
-        LoadRows(); // P0-3：装载内部已按默认序一次性建行，不再二次 ApplyDefaultOrder
-        UpdateColumnVisibility();
-        UpdateApplyEnabled();
-        AddInLogger.Info("ReloadSelection: 已用新选择集刷新 count=" + texts.Count);
-        return true;
+        // 新选择集/语言/项目以局部参数传入装载；_texts/_project 等字段在读段保持旧值，
+        // 直到读完后的同步提交段才一次性切换（读段任意点取消/异常，旧表与字段全部维持原状）。
+        await LoadRowsChunkedAsync(texts, sourceLang, projectLangs, project, langChanged, initial: false);
     }
 
-    private void LoadRows()
+    // P1：分块读每块大小；块间 await PumpUiAsync() 让出 UI 消息泵（遮罩重绘/取消按钮点击得以处理）。
+    private const int LoadChunkSize = 200;
+
+    /// <summary>
+    /// 让出 UI 消息泵：续体经 BeginInvoke 排到当前 UI 消息队列队尾（语义同 Task.Yield 的“让出且不立刻重入”），
+    /// 但不依赖是否安装了 WindowsFormsSynchronizationContext——保证 EPLAN 读段续体恒回 UI 线程，绝不落到线程池
+    /// （EPLAN API 非线程安全，任务书红线：禁止后台线程调 EPLAN API）。不在此处接取消：取消只在紧随其后的
+    /// 块边界 ThrowIfCancellationRequested 检查（那一行本身就跑在本 pump 的 UI 续体上），避免取消回调把续体弹到线程池。
+    /// </summary>
+    private Task PumpUiAsync()
     {
-        AddInLogger.Info("LoadRows: count=" + _texts.Count
-            + " 项目语言=[" + string.Join(",", _projectLangs.Select(LangHelper.Code)) + "] 源语言=" + _sourceLang);
-        var unknown = ISOCode.Language.L___;
+        var tcs = new TaskCompletionSource<bool>();
+        try
+        {
+            // 默认 TaskCreationOptions：TrySetResult 在下面这个 BeginInvoke 回调（恒为 UI 线程）内调用，
+            // await 续体内联在该 UI 线程继续——无论宿主是否安装 WindowsFormsSynchronizationContext 都不跳线程池。
+            BeginInvoke((Action)(() => tcs.TrySetResult(true)));
+        }
+        catch (InvalidOperationException)
+        {
+            // 句柄尚未创建：调用方随即以 IsDisposed/早返回处理；直接完成，不在此生异常
+            tcs.TrySetResult(true);
+        }
+        return tcs.Task;
+    }
+
+    private Task LoadRowsChunkedAsync(bool initial) =>
+        // 初始开窗：构造函数已把选择集/语言/项目存入字段且列结构已 BuildColumns，直接读本字段这一套，不重建列。
+        LoadRowsChunkedAsync(_texts, _sourceLang, _projectLangs, _project, langChanged: false, initial: initial);
+
+    /// <summary>
+    /// P1 Step2：分块异步装载编排。
+    /// 读段（EPLAN API）全部在 UI 线程、按 200 一块分块，块间 PumpUiAsync 让出消息泵，仅在块边界检查取消；
+    /// 读完后一次 DefaultOrdered，再进入【无 await、无取消点】的同步提交段一次性建行。
+    /// 取消语义：初始开窗=直接关窗（加载态关窗不弹三态）；Reload=旧表/字段完整保留（字段切换在提交段才发生）。
+    /// </summary>
+    private async Task LoadRowsChunkedAsync(List<TextBase> texts, ISOCode.Language sourceLang,
+        List<ISOCode.Language> projectLangs, Project? project, bool langChanged, bool initial)
+    {
+        var cts = new CancellationTokenSource();
+        _loadCts = cts;
+        _loading = true;
+        SetLoadingInputEnabled(false);
+        ShowLoadingOverlay(texts.Count);
+
+        List<SortView>? records = null;
+        var committed = false;
+        // 提交段失败标志：进入 CommitLoadedRows（已切字段/清表/半建行）后置 true，正常返回置 false。
+        // 提交段一旦抛异常，表处于错位态——initial 与 reload 都安全关窗，不弹“保持不变”、不恢复交互（避免 ApplySort 二次抛）。
+        var commitFailed = false;
+        try
+        {
+            // 先让遮罩完成首次绘制（泵一次 UI 队列）再进入读段，避免开窗后到首块让出前的短暂白屏。
+            await PumpUiAsync();
+            if (IsDisposed || _formIsClosing) { return; }
+
+            records = await ReadAllRecordsChunkedAsync(texts, sourceLang, projectLangs, project, cts.Token);
+
+            // 全部读完且未取消。窗已在关闭（加载态 X/Alt+F4）则绝不提交，避免触已释放控件。
+            if (IsDisposed || _formIsClosing) { return; }
+
+            // 同步提交段：内部无 await/取消点，一旦开始不会被取消打断。
+            commitFailed = true;
+            CommitLoadedRows(records, sourceLang, projectLangs, project, langChanged);
+            commitFailed = false;
+            committed = true;
+        }
+        catch (System.OperationCanceledException) // 全限定：与 Eplan.EplApi.DataModel.OperationCanceledException 区分（这里抓的是 CancellationToken 抛的系统异常）
+        {
+            AddInLogger.Info("装载已取消（块边界）：initial=" + initial + " n=" + texts.Count);
+        }
+        catch (Exception ex)
+        {
+            // 顶层兜底：读段异常=旧表与字段原样未动（reload 可保留旧表）；提交段异常=表已半切换，记日志并安全关窗，绝不假装“保持不变”。
+            AddInLogger.Error(commitFailed ? "分块装载提交段失败（表已半切换，将安全关窗）" : "分块装载读段失败", ex);
+            if (!IsDisposed && !_formIsClosing)
+            {
+                try
+                {
+                    var msg = commitFailed
+                        ? "装载文本失败：" + ex.Message + "\n\n表格处于未完成状态，窗口将关闭。详见日志。"
+                        : "装载文本失败：" + ex.Message + "\n\n详见日志。"
+                            + (initial ? string.Empty : "\n当前表格内容保持不变。");
+                    MessageBox.Show(this, msg, "文本批量编辑", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                }
+                catch (Exception) { /* 弹窗都失败时不再次生异常 */ }
+            }
+        }
+        finally
+        {
+            // 收尾先于“取消后关窗”：复位 _loading 后再 Close，使该 Close 走常规（无脏行、不弹三态）路径。
+            _loading = false;
+            if (!IsDisposed && !_formIsClosing)
+            {
+                // 提交段失败即将关窗：遮罩也保留（盖住半残表）、不恢复交互，直到 Close 生效。
+                if (!commitFailed)
+                {
+                    HideLoadingOverlay();
+                    SetLoadingInputEnabled(true);
+                }
+            }
+            try { cts.Dispose(); } catch (ObjectDisposedException) { /* 已释放 */ }
+            if (ReferenceEquals(_loadCts, cts)) { _loadCts = null; }
+
+            // Reload 读段失败（未提交、非提交段异常）：旧表完整保留，按旧表脏行重算“应用”按钮/状态条（加载开始时被统一禁用）。
+            // 提交成功时 CommitLoadedRows 内已重算；初始开窗未提交随即关窗、提交段失败即将关窗，均不重算。
+            if (!committed && !commitFailed && !initial && !IsDisposed && !_formIsClosing) { UpdateApplyEnabled(); }
+        }
+
+        // 需要关窗：①初始开窗装载未完成（空窗无旧表可留；异常已弹框、取消静默）；②提交段失败（表已半切换，initial/reload 皆然）。
+        // Reload 读段失败不在此列——字段切换/清表都在提交段，旧表完整保留，输入已在 finally 恢复。
+        // 注：加载态点 X 时 _formIsClosing 已为 true，由 OnFormClosing 直接关，不到这里。
+        if ((!committed && initial || commitFailed) && !IsDisposed && !_formIsClosing)
+        {
+            _suppressClosePrompt = true;
+            Close();
+        }
+    }
+
+    /// <summary>分块读全部对象：每块读完更新遮罩进度并 PumpUiAsync 让出一次；仅块边界 ThrowIfCancellationRequested。</summary>
+    private async Task<List<SortView>> ReadAllRecordsChunkedAsync(List<TextBase> texts,
+        ISOCode.Language sourceLang, List<ISOCode.Language> projectLangs, Project? project,
+        CancellationToken ct)
+    {
+        var n = texts.Count;
+        AddInLogger.Info("LoadRows: count=" + n
+            + " 项目语言=[" + string.Join(",", projectLangs.Select(LangHelper.Code)) + "] 源语言=" + sourceLang);
 
         var swPerfLoad = PerfTrace ? Stopwatch.StartNew() : null; // TEMP-PERF 装载总计
         if (PerfTrace) { _perfLastCfTicks = Stopwatch.GetTimestamp(); _perfLastCfCount = _perfCellFormattingCount; } // TEMP-PERF 装载计数窗基线
         Stopwatch? swPerfRank = null; // TEMP-PERF BuildRankMaps
         Stopwatch? swPerfRead = null; // TEMP-PERF EPLAN 读对象段累计（Contents/BuildMeta）
-        Stopwatch? swPerfGrid = null; // TEMP-PERF Rows.Add+赋格段累计
-        if (PerfTrace) { swPerfRead = new Stopwatch(); swPerfGrid = new Stopwatch(); } // TEMP-PERF
+        if (PerfTrace) { swPerfRank = Stopwatch.StartNew(); swPerfRead = new Stopwatch(); } // TEMP-PERF
 
-        _baseline.Clear();
-        _initial.Clear();
-        _stash.Clear();
-        _origIndex.Clear();
-        _meta.Clear();
-        if (PerfTrace) { swPerfRank = Stopwatch.StartNew(); } // TEMP-PERF
-        BuildRankMaps();
+        // rank 表必须在读之前按“新项目”建好（BuildMeta 的 RankOf 依赖它）。旧行排序用的是已固化进 _meta 的 rank，
+        // 清空/重建 rank 字典不改变旧表任何可见/排序行为；reload 读段取消时也仅影响后续排序，旧表不读这三个字典。
+        BuildRankMaps(project);
         if (PerfTrace) { swPerfRank!.Stop(); } // TEMP-PERF
 
-        var n = _texts.Count;
-        var colCount = _grid.Columns.Count;
         var records = new List<SortView>(n);
-
-        // —— P0-3 第一遍：只在内存为每个 TextBase 准备好整行数据（不建任何网格行），
-        //    杜绝旧版“先 Rows.Add 建全表 → ApplyDefaultOrder 读全格入 SortView → 排序 → 逐格写回”的装两遍。——
-        for (var i = 0; i < n; i++)
+        for (var start = 0; start < n; start += LoadChunkSize)
         {
-            var t = _texts[i];
-            var typeName = t.GetType().Name;
-            var isTranslated = true;
-            var noAutoTrans = false;
-            var values = new Dictionary<ISOCode.Language, string>();
-            string mirrorVal = string.Empty;
-
-            if (PerfTrace) { swPerfRead!.Start(); } // TEMP-PERF EPLAN 读段：Contents + BuildMeta
-            try
+            ct.ThrowIfCancellationRequested(); // 唯一取消点：块边界
+            var end = Math.Min(start + LoadChunkSize, n);
+            for (var i = start; i < end; i++)
             {
-                var c = t.Contents;
-                var langs = new LanguageList();
-                c.GetLanguageList(ref langs);
-                var hasUnknown = false;
-                var langNames = new List<string>();
-                for (var k = 0; k < langs.Count; k++)
-                {
-                    var l = langs.get_Language(k);
-                    langNames.Add(l.ToString());
-                    if (l == unknown) { hasUnknown = true; }
-                }
-
-                string pageName;
-                try { pageName = t.Page?.Name ?? "(无页)"; } catch { pageName = "(取页失败)"; }
-                // P0-1 装载期日志降噪：逐行文诊断仅在 PerfTrace 真机量测时写（MinLevel 保持 0，不改全局）
-                if (PerfTrace)
-                {
-                    AddInLogger.Debug("选中[" + i + "] 类型=" + typeName + " 页=" + pageName
-                        + " DBID=" + Safe(() => t.DatabaseIdentifier.ToString())
-                        + " 语言列表=[" + string.Join(",", langNames) + "]"
-                        + " IsAutomaticallyTranslated=" + Safe(() => t.IsAutomaticallyTranslated.ToString())
-                        + " InternalString=" + Preview(c.InternalString));
-                }
-                noAutoTrans = !t.IsAutomaticallyTranslated;
-
-                if (langs.Count == 0 || hasUnknown)
-                {
-                    isTranslated = false;
-                    var byDisplay = Safe(() => c.GetStringToDisplay(_sourceLang));
-                    var byUnknown = Safe(() => c.GetString(unknown));
-                    var internalRaw = c.InternalString ?? string.Empty;
-                    mirrorVal = PickClean(byDisplay, byUnknown, internalRaw);
-                }
-                else
-                {
-                    foreach (var lang in _projectLangs)
-                    {
-                        var v = Safe(() => c.GetString(lang));
-                        values[lang] = (v == "(null)" || v.StartsWith("(")) ? string.Empty : v;
-                    }
-                    mirrorVal = values.TryGetValue(_sourceLang, out var sv) ? sv : string.Empty;
-                }
+                records.Add(ReadRecord(texts[i], i, sourceLang, projectLangs, swPerfRead));
             }
-            catch (Exception ex)
-            {
-                AddInLogger.Error("读取对象 " + i + " 文本失败", ex);
-            }
-
-            var meta = BuildMeta(t); // 同属 EPLAN 读段（含结构/坐标）
-            if (PerfTrace) { swPerfRead!.Stop(); } // TEMP-PERF EPLAN 读段结束
-
-            // 源语言内容：多语言取源语言翻译，单语言取语言无关串；真实换行 → ¶，单元格单行显示
-            var srcVal = isTranslated
-                ? (values.TryGetValue(_sourceLang, out var sval) ? sval : string.Empty)
-                : mirrorVal;
-            srcVal = ToGrid(srcVal);
-
-            // 整行单元格值（序号列 ColIndex 先留空，排序盖章 1..n 在第二遍；默认序比较器只读 Meta/Orig）
-            var vals = new object?[colCount];
-            vals[ColType] = typeName;
-            vals[ColPage] = meta.PageName;
-            vals[ColPlant] = meta.Plant;
-            vals[ColPlace] = meta.Place;
-            vals[ColLocation] = meta.Location;
-            vals[ColX] = FormatCoord(meta.X);
-            vals[ColY] = FormatCoord(meta.Y);
-            vals[ColOrigMultilang] = isTranslated; // 原值侧复选框（只读，仅对照）
-            vals[ColOrigNoAuto] = noAutoTrans;
-            vals[ColMultilang] = isTranslated;     // 新值侧复选框（可编辑）
-            vals[ColNoAutoTrans] = noAutoTrans;
-            vals[_origTextCol] = srcVal;           // 文本列与源语言列同值（原值/新值两侧同步）
-            vals[_newTextCol] = srcVal;
-            vals[_origLangCol[_sourceLang]] = srcVal;
-            vals[_newLangCol[_sourceLang]] = srcVal;
-            foreach (var lang in _projectLangs)
-            {
-                if (lang == _sourceLang) { continue; }
-                var gv = ToGrid(isTranslated && values.TryGetValue(lang, out var x) ? x : string.Empty);
-                vals[_origLangCol[lang]] = gv;
-                vals[_newLangCol[lang]] = gv;
-            }
-
-            // 已保存基线：与旧版“建行填充后 SnapshotRow(rowIdx)”逐字段同源——
-            // 标志取两个复选框值；单语言只跟踪源语言；各语言值即新值语言格内容。
-            var snap = new RowState { Multilang = isTranslated, NoAuto = noAutoTrans };
-            foreach (var lang in _projectLangs)
-            {
-                if (!isTranslated && lang != _sourceLang) { continue; }
-                snap.V[lang] = lang == _sourceLang
-                    ? srcVal
-                    : ToGrid(values.TryGetValue(lang, out var lv) ? lv : string.Empty);
-            }
-
-            records.Add(new SortView
-            {
-                Values = vals,
-                T = t,
-                Base = snap,
-                Init = CloneRow(snap),
-                Stash = new Dictionary<ISOCode.Language, string>(),
-                Orig = i,
-                Meta = meta,
-            });
+            UpdateLoadingOverlay(end, n);
+            await PumpUiAsync(); // 排队到 UI 消息队列队尾：遮罩进度重绘 + 取消按钮点击得以泵取；硬保证续体回 UI 线程（非后台线程调 EPLAN API）
         }
+        ct.ThrowIfCancellationRequested(); // 末块让出期间用户也可能点了取消：提交前再兜一次
+        if (PerfTrace)
+        {
+            swPerfLoad!.Stop(); // TEMP-PERF
+            AddInLogger.Debug("PERF LoadRows(读段): 总=" + swPerfLoad.Elapsed.TotalMilliseconds.ToString("0.0") + "ms n=" + n // TEMP-PERF
+                + " EPLAN读对象段(Contents/meta)=" + swPerfRead!.Elapsed.TotalMilliseconds.ToString("0.0") + "ms"
+                + " BuildRankMaps=" + swPerfRank!.Elapsed.TotalMilliseconds.ToString("0.0") + "ms");
+        }
+        return records;
+    }
 
-        // 默认序：复用列头排序走的同一个 DefaultOrdered 比较器（结构管理顺序 高层→安装→位置 → X↑ → Y↓ → 开窗序号）。
-        // OrderBy/ThenBy 为稳定排序，故这里的顺序与旧版 ApplyDefaultOrder→ApplySort(ColIndex,0) 逐行一致。
-        var sorted = DefaultOrdered(records).ToList();
+    /// <summary>
+    /// 读单个对象 → 一条 SortView 记录（Values 暂空，列值在提交段按列映射组装）。纯 EPLAN 读 + 内存准备，
+    /// 不碰 grid、不碰任何并排列表字段；异常由调用方编排统一兜底（单对象 Contents 失败沿用 P0 的行内 try/catch）。
+    /// </summary>
+    private SortView ReadRecord(TextBase t, int origIndex, ISOCode.Language sourceLang,
+        List<ISOCode.Language> projectLangs, Stopwatch? swPerfRead)
+    {
+        var unknown = ISOCode.Language.L___;
+        var typeName = t.GetType().Name;
+        var isTranslated = true;
+        var noAutoTrans = false;
+        var values = new Dictionary<ISOCode.Language, string>();
+        string mirrorVal = string.Empty;
 
-        // —— P0-3 第二遍：按默认序一次性 Rows.Add 并填充，行号盖章 1..n；各并排列表按同一顺序写入。
-        //    此后显示行 i 恒对应 _texts[i]/_baseline[i]/_initial[i]/_stash[i]/_origIndex[i]/_meta[i]（SaveDirty/排序/自动保存/转到图形的下标假设不变）。——
-        _syncing = true;
-        _grid.Rows.Clear();
+        if (PerfTrace) { swPerfRead?.Start(); } // TEMP-PERF EPLAN 读段：Contents
         try
         {
+            var c = t.Contents;
+            var langs = new LanguageList();
+            c.GetLanguageList(ref langs);
+            var hasUnknown = false;
+            var langNames = new List<string>();
+            for (var k = 0; k < langs.Count; k++)
+            {
+                var l = langs.get_Language(k);
+                langNames.Add(l.ToString());
+                if (l == unknown) { hasUnknown = true; }
+            }
+
+            string pageName;
+            try { pageName = t.Page?.Name ?? "(无页)"; } catch { pageName = "(取页失败)"; }
+            // P0-1 装载期日志降噪：逐行文诊断仅在 PerfTrace 真机量测时写（MinLevel 保持 0，不改全局）
+            if (PerfTrace)
+            {
+                AddInLogger.Debug("选中[" + origIndex + "] 类型=" + typeName + " 页=" + pageName
+                    + " DBID=" + Safe(() => t.DatabaseIdentifier.ToString())
+                    + " 语言列表=[" + string.Join(",", langNames) + "]"
+                    + " IsAutomaticallyTranslated=" + Safe(() => t.IsAutomaticallyTranslated.ToString())
+                    + " InternalString=" + Preview(c.InternalString));
+            }
+            noAutoTrans = !t.IsAutomaticallyTranslated;
+
+            if (langs.Count == 0 || hasUnknown)
+            {
+                isTranslated = false;
+                var byDisplay = Safe(() => c.GetStringToDisplay(sourceLang));
+                var byUnknown = Safe(() => c.GetString(unknown));
+                var internalRaw = c.InternalString ?? string.Empty;
+                mirrorVal = PickClean(byDisplay, byUnknown, internalRaw);
+            }
+            else
+            {
+                foreach (var lang in projectLangs)
+                {
+                    var v = Safe(() => c.GetString(lang));
+                    values[lang] = (v == "(null)" || v.StartsWith("(")) ? string.Empty : v;
+                }
+                mirrorVal = values.TryGetValue(sourceLang, out var sv) ? sv : string.Empty;
+            }
+        }
+        catch (Exception ex)
+        {
+            AddInLogger.Error("读取对象 " + origIndex + " 文本失败", ex);
+        }
+
+        var meta = BuildMeta(t); // 同属 EPLAN 读段（含结构/坐标，rank 已按新项目建好）
+        if (PerfTrace) { swPerfRead?.Stop(); } // TEMP-PERF EPLAN 读段结束
+
+        // 源语言内容：多语言取源语言翻译，单语言取语言无关串；真实换行 → ¶，单元格单行显示
+        var srcVal = isTranslated
+            ? (values.TryGetValue(sourceLang, out var sval) ? sval : string.Empty)
+            : mirrorVal;
+        srcVal = ToGrid(srcVal);
+
+        // 已保存基线：与旧版“建行填充后 SnapshotRow(rowIdx)”逐字段同源——
+        // 标志取两个复选框值；单语言只跟踪源语言；各语言值即新值语言格内容。
+        var snap = new RowState { Multilang = isTranslated, NoAuto = noAutoTrans };
+        foreach (var lang in projectLangs)
+        {
+            if (!isTranslated && lang != sourceLang) { continue; }
+            snap.V[lang] = lang == sourceLang
+                ? srcVal
+                : ToGrid(values.TryGetValue(lang, out var lv) ? lv : string.Empty);
+        }
+
+        // Values 留空：提交段列结构确定后再按列映射组装（Height=0=全新行不设高，与旧 LoadRows 一致）。
+        return new SortView
+        {
+            Values = null!,
+            T = t,
+            Base = snap,
+            Init = CloneRow(snap),
+            Stash = new Dictionary<ISOCode.Language, string>(),
+            Orig = origIndex,
+            Meta = meta,
+        };
+    }
+
+    /// <summary>
+    /// 同步提交段（无 await、无取消点）：一次 DefaultOrdered → 切换字段/（按需）重建列 → 清表 → 一次性建行。
+    /// 并排列表只在对应行 Rows.Add 成功后按同一 i 追加，故任一点异常 Rows.Count 恒等于各列表计数。
+    /// 默认序/行号/基线语义与 P0 LoadRows 逐行一致（同一个 DefaultOrdered 比较器）。
+    /// </summary>
+    private void CommitLoadedRows(List<SortView> records,
+        ISOCode.Language sourceLang, List<ISOCode.Language> projectLangs, Project? project,
+        bool langChanged)
+    {
+        var n = records.Count;
+        var swPerfGrid = PerfTrace ? Stopwatch.StartNew() : null; // TEMP-PERF Rows.Add+赋格段
+
+        // 1) 默认序：复用列头排序走的同一个 DefaultOrdered（结构管理顺序 高层→安装→位置 → X↑ → Y↓ → 开窗序号）。
+        var sorted = DefaultOrdered(records).ToList();
+
+        // 2) 字段/标题一次性切换（旧状态自此才被替换）；按需重建列。顺序与 P0 Reload 一致。
+        // _texts 不在此切换：它与其余并排列表同在下面清表点新建空表、逐行追加，保证任意失败点计数一致。
+        DisposeAutoSaveTimer();
+        _project = project;
+        _sourceLang = sourceLang;
+        _projectLangs = projectLangs;
+        Text = "文本批量编辑（源语言：" + LangHelper.Code(sourceLang) + "，共 " + n + " 个文本）";
+        if (langChanged) { BuildColumns(); }
+        var colCount = _grid.Columns.Count;
+
+        // 3) 组装每行单元格值 + 一次性建行（REDRAW 全程 try/finally 复位）。
+        _syncing = true;
+        SetGridRedraw(false); // 批量建行期间挂起重绘；finally 中务必与 _syncing 一并恢复
+        try
+        {
+            _grid.Rows.Clear();
+            // 与 Rows.Clear 对应，六个并排列表（含 _texts）全部从空开始；此后每个成功 Rows.Add 配同 i 各追加一次。
+            _texts = new List<TextBase>(n);
+            _baseline.Clear();
+            _initial.Clear();
+            _stash.Clear();
+            _origIndex.Clear();
+            _meta.Clear();
+
             for (var i = 0; i < n; i++)
             {
                 var v = sorted[i];
-                v.Values[ColIndex] = (i + 1).ToString(); // 默认序固定排名盖章
-                if (PerfTrace) { swPerfGrid!.Start(); } // TEMP-PERF 入表段
-                var rowIdx = _grid.Rows.Add();
-                var row = _grid.Rows[rowIdx];
-                for (var c = 0; c < colCount; c++) { row.Cells[c].Value = v.Values[c]; }
-                row.HeaderCell.Value = (i + 1).ToString(); // 行头行号
-                // 全新行自带 RowTemplate 高度（与旧 LoadRows 加行不设高一致）；无需像 ApplySort 复用物理行那样回填 Height
-                SetRowEditable(i, Convert.ToBoolean(v.Values[ColMultilang] ?? false));
-                if (PerfTrace) { swPerfGrid!.Stop(); } // TEMP-PERF 入表段
+                var isTranslated = v.Base.Multilang;
+                var noAutoTrans = v.Base.NoAuto;
+                var srcVal = v.Base.V.TryGetValue(sourceLang, out var sv) ? sv : string.Empty;
 
-                _texts[i] = v.T;
+                var vals = new object?[colCount];
+                vals[ColType] = v.T.GetType().Name;
+                vals[ColPage] = v.Meta.PageName;
+                vals[ColPlant] = v.Meta.Plant;
+                vals[ColPlace] = v.Meta.Place;
+                vals[ColLocation] = v.Meta.Location;
+                vals[ColX] = FormatCoord(v.Meta.X);
+                vals[ColY] = FormatCoord(v.Meta.Y);
+                vals[ColOrigMultilang] = isTranslated; // 原值侧复选框（只读，仅对照）
+                vals[ColOrigNoAuto] = noAutoTrans;
+                vals[ColMultilang] = isTranslated;     // 新值侧复选框（可编辑）
+                vals[ColNoAutoTrans] = noAutoTrans;
+                vals[_origTextCol] = srcVal;           // 文本列与源语言列同值（原值/新值两侧同步）
+                vals[_newTextCol] = srcVal;
+                vals[_origLangCol[sourceLang]] = srcVal;
+                vals[_newLangCol[sourceLang]] = srcVal;
+                foreach (var lang in projectLangs)
+                {
+                    if (lang == sourceLang) { continue; }
+                    var gv = v.Base.V.TryGetValue(lang, out var lv) ? lv : string.Empty; // 单语言行无此键→空，与 P0 等价
+                    vals[_origLangCol[lang]] = gv;
+                    vals[_newLangCol[lang]] = gv;
+                }
+                v.Values = vals;
+                v.Values[ColIndex] = (i + 1).ToString(); // 默认序固定排名盖章
+
+                // Rows.Add() 成功后【立即】按同一 i 追加六个并排列表，再做赋格/SetRowEditable：
+                // 此后赋格、HeaderCell、SetRowEditable 任一点抛异常，Rows.Count 恒等于六列表计数（均 i+1）。
+                var rowIdx = _grid.Rows.Add();
+                _texts.Add(v.T);
                 _baseline.Add(v.Base);
                 _initial.Add(v.Init);
                 _stash.Add(v.Stash);
                 _origIndex.Add(v.Orig);
                 _meta.Add(v.Meta);
+
+                var row = _grid.Rows[rowIdx];
+                for (var c = 0; c < colCount; c++) { row.Cells[c].Value = v.Values[c]; }
+                row.HeaderCell.Value = (i + 1).ToString(); // 行头行号
+                // 全新行自带 RowTemplate 高度（与旧 LoadRows 加行不设高一致）
+                SetRowEditable(i, isTranslated);
             }
         }
         finally
         {
             _syncing = false;
+            SetGridRedraw(true);
         }
 
-        // 等价旧“LoadRows + ApplyDefaultOrder”终态：Clear()+逐行 Add 后显式清选区/当前格，
-        // 复刻旧 ApplySort 末尾两句（Reload 时窗体已可见，避免首行被自动设为 CurrentCell）。
+        // 等价旧 LoadRows 终态：Clear()+逐行 Add 后无选中、CurrentCell=null。
         _grid.ClearSelection();
         _grid.CurrentCell = null;
 
-        // 装载即默认序、无列头排序箭头（承接旧 ApplyDefaultOrder 对 _sortCol/_sortDir 的复位；
-        // CellPainting/AutoFitColumns 据此不画箭头、不留箭头余量）
+        // 装载即默认序、无列头排序箭头（承接旧 ApplyDefaultOrder 对 _sortCol/_sortDir 的复位）
         _sortCol = -1;
         _sortDir = 0;
-        // 行首宽只按总行数位数程序化设一次（O(1) GDI，旧版由随后的 ApplySort 负责，装载不再二次排序故在此设置）；
-        // 首次构造句柄未创建时 FromHwnd(Zero) 不依赖句柄，安全
         EnsureRowHeadersWidth(n);
 
+        // Reload 时列结构/可见性可能需刷新（含一次自动列宽，此时已有真实行可采样）；初始开窗 Shown 已先跑过空表一次。
+        UpdateColumnVisibility();
+        UpdateApplyEnabled();
+        // 自动保存开关若处于开启，装载完成恢复固定节拍（装载期 ScheduleAutoSave 被挂住、旧 Timer 已在切换时释放）。
+        if (_autoSaveChk != null && _autoSaveChk.Checked) { ScheduleAutoSave(); }
+
+        AddInLogger.Info("LoadRows 提交完成 count=" + n + "（默认序一次性建行）");
         if (PerfTrace)
         {
-            swPerfLoad!.Stop(); // TEMP-PERF
-            AddInLogger.Debug("PERF LoadRows: 总=" + swPerfLoad.Elapsed.TotalMilliseconds.ToString("0.0") + "ms n=" + n // TEMP-PERF
-                + " EPLAN读对象段(Contents/meta)=" + swPerfRead!.Elapsed.TotalMilliseconds.ToString("0.0") + "ms"
-                + " Rows.Add+赋格段=" + swPerfGrid!.Elapsed.TotalMilliseconds.ToString("0.0") + "ms"
-                + " BuildRankMaps=" + swPerfRank!.Elapsed.TotalMilliseconds.ToString("0.0") + "ms " + PerfCfWindowReset());
+            swPerfGrid!.Stop(); // TEMP-PERF
+            AddInLogger.Debug("PERF LoadRows(提交段): Rows.Add+赋格=" + swPerfGrid.Elapsed.TotalMilliseconds.ToString("0.0") + "ms" // TEMP-PERF
+                + " n=" + n + " " + PerfCfWindowReset());
         }
     }
 
@@ -2067,6 +2319,9 @@ public class TextBatchEditForm : Form
     {
         if (_saving || _autoSaveChk == null || !_autoSaveChk.Checked) { return; }
         if (IsDisposed) { return; }
+        // P1：分块装载期间挂住自动保存上档——此时网格没有完整行，落库无对象且与装载写表互斥。
+        // 装载成功收尾会主动 ScheduleAutoSave() 恢复节拍；取消关窗则无恢复必要。
+        if (_loading) { return; }
         if (_autoSaveTimer == null)
         {
             _autoSaveTimer = new System.Windows.Forms.Timer { Interval = AutoSaveCadenceMs };
@@ -2078,6 +2333,8 @@ public class TextBatchEditForm : Form
                     _autoSaveTimer.Stop();
                     return;
                 }
+                // P1：分块装载期间跳过本拍但不停表（保持固定节拍），装载完成后自然恢复；绝不与装载写表并发。
+                if (_loading) { return; }
                 // 正在文本编辑的那一行本轮整行排除（不写、不 EndEdit、不回读、不刷新）；
                 // 其他已静止的脏行照常落库，不因当前格在编辑而整轮跳过。
                 int? editRow = null;
@@ -2920,6 +3177,104 @@ public class TextBatchEditForm : Form
     private class BufferedPanel : Panel
     {
         public BufferedPanel() { DoubleBuffered = true; }
+    }
+
+    /// <summary>
+    /// P1 加载遮罩：Dock.Fill 盖在标签区之上（底栏由按钮禁用单独处理），居中卡片显示
+    /// “已处理 n / 总数（百分比）”+ ProgressBar + 取消按钮。取消按钮只发请求，真正生效在块边界。
+    /// </summary>
+    private sealed class LoadingOverlay : Panel
+    {
+        private readonly Action _onCancel;
+        private readonly Panel _card;
+        private readonly Label _progressLabel;
+        private readonly ProgressBar _bar;
+        private readonly Button _cancelBtn;
+        private int _total;
+
+        public LoadingOverlay(Action onCancel)
+        {
+            _onCancel = onCancel;
+            Dock = DockStyle.Fill;
+            // 纯色浅灰遮罩（WinForms 普通 Panel 不与下层兄弟控件做 alpha 混合，纯色即足以遮蔽并接管交互）
+            BackColor = System.Drawing.Color.FromArgb(236, 240, 245);
+            SetStyle(ControlStyles.Selectable, true);
+            TabStop = true; // 加载期焦点落在遮罩，不落到下层 grid
+
+            _card = new Panel
+            {
+                Size = new Size(320, 140),
+                BackColor = System.Drawing.Color.White,
+                BorderStyle = BorderStyle.FixedSingle,
+            };
+
+            var title = new Label
+            {
+                Text = "正在加载文本…",
+                Location = new Point(18, 14),
+                AutoSize = false,
+                Size = new Size(284, 22),
+                TextAlign = ContentAlignment.MiddleLeft,
+                ForeColor = System.Drawing.Color.FromArgb(40, 40, 40),
+            };
+            // 不 new Font（控件不自动释放 Font 会泄漏 GDI 对象）：标题靠位置/颜色区分，普通字体即可。
+
+            _progressLabel = new Label
+            {
+                Location = new Point(18, 42),
+                Size = new Size(284, 20),
+                TextAlign = ContentAlignment.MiddleLeft,
+                ForeColor = System.Drawing.Color.FromArgb(90, 90, 90),
+            };
+
+            _bar = new ProgressBar { Location = new Point(18, 66), Size = new Size(284, 18), Minimum = 0, Maximum = 1 };
+
+            _cancelBtn = new Button { Text = "取消", Size = new Size(90, 28) };
+            _cancelBtn.Location = new Point((_card.Width - _cancelBtn.Width) / 2, 100);
+            _cancelBtn.Click += (_, _) =>
+            {
+                // 仅发出取消请求；块边界才真正停止。立即禁用并改名给用户反馈，防连点。
+                _cancelBtn.Enabled = false;
+                _cancelBtn.Text = "取消中…";
+                _onCancel();
+            };
+
+            _card.Controls.Add(title);
+            _card.Controls.Add(_progressLabel);
+            _card.Controls.Add(_bar);
+            _card.Controls.Add(_cancelBtn);
+            Controls.Add(_card);
+        }
+
+        protected override void OnSizeChanged(EventArgs e)
+        {
+            base.OnSizeChanged(e);
+            _card.Location = new Point((Width - _card.Width) / 2, (Height - _card.Height) / 2);
+        }
+
+        /// <summary>每次装载开始：复位进度与取消按钮。</summary>
+        public void Begin(int total)
+        {
+            _total = total;
+            _bar.Maximum = Math.Max(1, total);
+            _bar.Value = 0;
+            _cancelBtn.Enabled = true;
+            _cancelBtn.Text = "取消";
+            ReportProgress(0, total);
+        }
+
+        public void ReportProgress(int done, int total)
+        {
+            if (total != _total)
+            {
+                _total = total;
+                _bar.Maximum = Math.Max(1, total);
+            }
+            var d = Math.Max(0, Math.Min(done, total));
+            if (d >= 0 && d <= _bar.Maximum) { _bar.Value = d; }
+            var pct = total <= 0 ? 0 : (int)Math.Round(100.0 * done / total);
+            _progressLabel.Text = "已处理 " + done + " / " + total + "（" + pct + "%）";
+        }
     }
 
     /// <summary>
