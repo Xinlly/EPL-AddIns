@@ -134,7 +134,7 @@ public class TextBatchEditForm : Form
     {
         if (n <= 0) { return; }
         var longest = new string('9', n.ToString().Length);
-        // 屏幕 DC：构造函数里 ApplyDefaultOrder 首次调用时网格句柄尚未创建，FromHwnd(Zero) 不依赖句柄、不强制提前建窗
+        // 屏幕 DC：构造函数里 LoadRows 首次调用时网格句柄尚未创建，FromHwnd(Zero) 不依赖句柄、不强制提前建窗
         using var g = Graphics.FromHwnd(IntPtr.Zero);
         var w = TextRenderer.MeasureText(g, longest, _grid.Font, Size.Empty,
             TextFormatFlags.SingleLine | TextFormatFlags.NoPadding).Width;
@@ -265,9 +265,7 @@ public class TextBatchEditForm : Form
         BuildGrid();
         BuildTabs();
         BuildBottomBar();
-        LoadRows();
-        // 开窗即按默认规则排序：结构标识符管理顺序 → X 升 → Y 降
-        ApplyDefaultOrder();
+        LoadRows(); // P0-3：装载即按默认序一次性建行（结构标识符管理顺序 → X↑ → Y↓），不再随后二次 ApplyDefaultOrder
         UpdateApplyEnabled();
         // 应用层消息过滤器：在消息派发前吞掉编辑态的 Ctrl+Enter，防止被 DataGridView 当成“结束编辑”
         _keyFilter = new CtrlEnterFilter(this);
@@ -1011,11 +1009,25 @@ public class TextBatchEditForm : Form
         const int minW = 40, maxW = 420;
         const int pad = 8;           // 文字左右内边距合计
         const int arrowReserve = 18; // 仅当前排序列给排序箭头预留
+        // P0-2：数据行不再全量 GDI 测量，按当前行序等间隔最多采样 300 行（必含首行与末行）；
+        // 表头仍逐列测，pad/箭头/min/max 余量与旧实现一致。
+        const int maxSampleRows = 300;
         var flags = TextFormatFlags.SingleLine | TextFormatFlags.Left | TextFormatFlags.NoPadding;
 
         using var g = _grid.CreateGraphics();
         var cellFont = _grid.Font;
         var headFont = _grid.ColumnHeadersDefaultCellStyle.Font ?? _grid.Font;
+
+        // 采样行下标（与具体列无关，列循环外算一次）：行数 ≤ 上限时全测；
+        // 否则 s*(n-1)/(N-1) 整数取下标，严格递增、必含 0 与 n-1（n>N 时步长 >1，无重复）。
+        var rowCount = _grid.Rows.Count;
+        var sampleRows = new int[Math.Min(rowCount, maxSampleRows)];
+        for (var s = 0; s < sampleRows.Length; s++)
+        {
+            sampleRows[s] = sampleRows.Length == rowCount
+                ? s
+                : (int)((long)s * (rowCount - 1) / (maxSampleRows - 1));
+        }
 
         foreach (DataGridViewColumn col in _grid.Columns)
         {
@@ -1034,10 +1046,10 @@ public class TextBatchEditForm : Form
                 best = Math.Max(best, 16); // 复选框本体占位
             }
 
-            // 数据单元格内容（¶ 单行显示，不换行）
-            foreach (DataGridViewRow row in _grid.Rows)
+            // 数据单元格内容（¶ 单行显示，不换行）：只测采样行，split/标志处理与旧实现一致
+            for (var ri = 0; ri < sampleRows.Length; ri++)
             {
-                var s = row.Cells[col.Index].Value?.ToString();
+                var s = _grid.Rows[sampleRows[ri]].Cells[col.Index].Value?.ToString();
                 if (string.IsNullOrEmpty(s)) { continue; }
                 foreach (var line in s!.Split('\n'))
                 {
@@ -1456,14 +1468,20 @@ public class TextBatchEditForm : Form
                 m.Plant = PageIdent(pp.DESIGNATION_FULLPLANT);
                 m.Place = PageIdent(pp.DESIGNATION_FULLPLACEOFINSTALLATION);
                 m.Location = PageIdent(pp.DESIGNATION_FULLLOCATION);
-                AddInLogger.Debug("页结构 完整页名=" + (page.Name ?? string.Empty)
-                    + " 纯页名=[" + m.PageName + "]"
-                    + " 高层=[" + m.Plant + "] 安装=[" + m.Place + "] 位置=[" + m.Location + "]");
+                // P0-1 装载期日志降噪：此行随每行文输出（n=10000 即上万次 AppendAllText），
+                // 仅在 PerfTrace 真机量测时写；MinLevel 保持 0 不动，现场排查改 PerfTrace=true。
+                if (PerfTrace)
+                {
+                    AddInLogger.Debug("页结构 完整页名=" + (page.Name ?? string.Empty)
+                        + " 纯页名=[" + m.PageName + "]"
+                        + " 高层=[" + m.Plant + "] 安装=[" + m.Place + "] 位置=[" + m.Location + "]");
+                }
             }
         }
         catch (Exception ex)
         {
-            AddInLogger.Debug("读取结构标识符失败：" + ex.Message);
+            // 同一坏对象/坏属性会让该 catch 随行数重复触发，同样按 PerfTrace 门控
+            if (PerfTrace) { AddInLogger.Debug("读取结构标识符失败：" + ex.Message); }
         }
 
         try
@@ -1474,7 +1492,8 @@ public class TextBatchEditForm : Form
         }
         catch (Exception ex)
         {
-            AddInLogger.Debug("读取坐标失败：" + ex.Message);
+            // 同上：该 catch 可能随行数重复触发，按 PerfTrace 门控
+            if (PerfTrace) { AddInLogger.Debug("读取坐标失败：" + ex.Message); }
         }
 
         m.PlantRank = RankOf(_plantRank, m.Plant);
@@ -1512,14 +1531,6 @@ public class TextBatchEditForm : Form
 
     /// <summary>坐标（mm）显示：整数不带小数点，最多 3 位小数。</summary>
     private static string FormatCoord(double v) => v.ToString("0.###");
-
-    /// <summary>开窗默认排序入口：结构标识符管理顺序 → X 升 → Y 降。</summary>
-    private void ApplyDefaultOrder()
-    {
-        _sortCol = -1;
-        _sortDir = 0;
-        ApplySort(ColIndex, 0);
-    }
 
     /// <summary>
     /// 窗口已常驻时，用最新选择集刷新表格行。选择集未变化则什么都不做；
@@ -1567,8 +1578,7 @@ public class TextBatchEditForm : Form
         {
             BuildColumns();
         }
-        LoadRows();
-        ApplyDefaultOrder();
+        LoadRows(); // P0-3：装载内部已按默认序一次性建行，不再二次 ApplyDefaultOrder
         UpdateColumnVisibility();
         UpdateApplyEnabled();
         AddInLogger.Info("ReloadSelection: 已用新选择集刷新 count=" + texts.Count);
@@ -1584,7 +1594,7 @@ public class TextBatchEditForm : Form
         var swPerfLoad = PerfTrace ? Stopwatch.StartNew() : null; // TEMP-PERF 装载总计
         if (PerfTrace) { _perfLastCfTicks = Stopwatch.GetTimestamp(); _perfLastCfCount = _perfCellFormattingCount; } // TEMP-PERF 装载计数窗基线
         Stopwatch? swPerfRank = null; // TEMP-PERF BuildRankMaps
-        Stopwatch? swPerfRead = null; // TEMP-PERF EPLAN 读对象段累计（Contents/语言列表/meta）
+        Stopwatch? swPerfRead = null; // TEMP-PERF EPLAN 读对象段累计（Contents/BuildMeta）
         Stopwatch? swPerfGrid = null; // TEMP-PERF Rows.Add+赋格段累计
         if (PerfTrace) { swPerfRead = new Stopwatch(); swPerfGrid = new Stopwatch(); } // TEMP-PERF
 
@@ -1596,131 +1606,183 @@ public class TextBatchEditForm : Form
         if (PerfTrace) { swPerfRank = Stopwatch.StartNew(); } // TEMP-PERF
         BuildRankMaps();
         if (PerfTrace) { swPerfRank!.Stop(); } // TEMP-PERF
-        _syncing = true;
-        _grid.Rows.Clear();
-        try
+
+        var n = _texts.Count;
+        var colCount = _grid.Columns.Count;
+        var records = new List<SortView>(n);
+
+        // —— P0-3 第一遍：只在内存为每个 TextBase 准备好整行数据（不建任何网格行），
+        //    杜绝旧版“先 Rows.Add 建全表 → ApplyDefaultOrder 读全格入 SortView → 排序 → 逐格写回”的装两遍。——
+        for (var i = 0; i < n; i++)
         {
-            for (var i = 0; i < _texts.Count; i++)
+            var t = _texts[i];
+            var typeName = t.GetType().Name;
+            var isTranslated = true;
+            var noAutoTrans = false;
+            var values = new Dictionary<ISOCode.Language, string>();
+            string mirrorVal = string.Empty;
+
+            if (PerfTrace) { swPerfRead!.Start(); } // TEMP-PERF EPLAN 读段：Contents + BuildMeta
+            try
             {
-                var t = _texts[i];
-                var typeName = t.GetType().Name;
-                var isTranslated = true;
-                var noAutoTrans = false;
-                var values = new Dictionary<ISOCode.Language, string>();
-                string mirrorVal = string.Empty;
-
-                try
+                var c = t.Contents;
+                var langs = new LanguageList();
+                c.GetLanguageList(ref langs);
+                var hasUnknown = false;
+                var langNames = new List<string>();
+                for (var k = 0; k < langs.Count; k++)
                 {
-                    if (PerfTrace) { swPerfGrid!.Stop(); swPerfRead!.Start(); } // TEMP-PERF 下一轮读段起：先封口上一轮赋格表（首轮 grid 未运行，Stop 为安全 no-op），再启读段，保证两段严格互斥
-                    var c = t.Contents;
-                    var langs = new LanguageList();
-                    c.GetLanguageList(ref langs);
-                    var hasUnknown = false;
-                    var langNames = new List<string>();
-                    for (var k = 0; k < langs.Count; k++)
-                    {
-                        var l = langs.get_Language(k);
-                        langNames.Add(l.ToString());
-                        if (l == unknown) { hasUnknown = true; }
-                    }
+                    var l = langs.get_Language(k);
+                    langNames.Add(l.ToString());
+                    if (l == unknown) { hasUnknown = true; }
+                }
 
-                    string pageName;
-                    try { pageName = t.Page?.Name ?? "(无页)"; } catch { pageName = "(取页失败)"; }
+                string pageName;
+                try { pageName = t.Page?.Name ?? "(无页)"; } catch { pageName = "(取页失败)"; }
+                // P0-1 装载期日志降噪：逐行文诊断仅在 PerfTrace 真机量测时写（MinLevel 保持 0，不改全局）
+                if (PerfTrace)
+                {
                     AddInLogger.Debug("选中[" + i + "] 类型=" + typeName + " 页=" + pageName
                         + " DBID=" + Safe(() => t.DatabaseIdentifier.ToString())
                         + " 语言列表=[" + string.Join(",", langNames) + "]"
                         + " IsAutomaticallyTranslated=" + Safe(() => t.IsAutomaticallyTranslated.ToString())
                         + " InternalString=" + Preview(c.InternalString));
-                    noAutoTrans = !t.IsAutomaticallyTranslated;
-
-                    if (langs.Count == 0 || hasUnknown)
-                    {
-                        isTranslated = false;
-                        var byDisplay = Safe(() => c.GetStringToDisplay(_sourceLang));
-                        var byUnknown = Safe(() => c.GetString(unknown));
-                        var internalRaw = c.InternalString ?? string.Empty;
-                        mirrorVal = PickClean(byDisplay, byUnknown, internalRaw);
-                    }
-                    else
-                    {
-                        foreach (var lang in _projectLangs)
-                        {
-                            var v = Safe(() => c.GetString(lang));
-                            values[lang] = (v == "(null)" || v.StartsWith("(")) ? string.Empty : v;
-                        }
-                        mirrorVal = values.TryGetValue(_sourceLang, out var sv) ? sv : string.Empty;
-                    }
                 }
-                catch (Exception ex)
+                noAutoTrans = !t.IsAutomaticallyTranslated;
+
+                if (langs.Count == 0 || hasUnknown)
                 {
-                    AddInLogger.Error("读取对象 " + i + " 文本失败", ex);
+                    isTranslated = false;
+                    var byDisplay = Safe(() => c.GetStringToDisplay(_sourceLang));
+                    var byUnknown = Safe(() => c.GetString(unknown));
+                    var internalRaw = c.InternalString ?? string.Empty;
+                    mirrorVal = PickClean(byDisplay, byUnknown, internalRaw);
                 }
-                if (PerfTrace) { swPerfRead!.Stop(); } // TEMP-PERF EPLAN 读对象段（Contents）结束
+                else
+                {
+                    foreach (var lang in _projectLangs)
+                    {
+                        var v = Safe(() => c.GetString(lang));
+                        values[lang] = (v == "(null)" || v.StartsWith("(")) ? string.Empty : v;
+                    }
+                    mirrorVal = values.TryGetValue(_sourceLang, out var sv) ? sv : string.Empty;
+                }
+            }
+            catch (Exception ex)
+            {
+                AddInLogger.Error("读取对象 " + i + " 文本失败", ex);
+            }
 
-                if (PerfTrace) { swPerfGrid!.Start(); } // TEMP-PERF Rows.Add+赋格段开始
+            var meta = BuildMeta(t); // 同属 EPLAN 读段（含结构/坐标）
+            if (PerfTrace) { swPerfRead!.Stop(); } // TEMP-PERF EPLAN 读段结束
+
+            // 源语言内容：多语言取源语言翻译，单语言取语言无关串；真实换行 → ¶，单元格单行显示
+            var srcVal = isTranslated
+                ? (values.TryGetValue(_sourceLang, out var sval) ? sval : string.Empty)
+                : mirrorVal;
+            srcVal = ToGrid(srcVal);
+
+            // 整行单元格值（序号列 ColIndex 先留空，排序盖章 1..n 在第二遍；默认序比较器只读 Meta/Orig）
+            var vals = new object?[colCount];
+            vals[ColType] = typeName;
+            vals[ColPage] = meta.PageName;
+            vals[ColPlant] = meta.Plant;
+            vals[ColPlace] = meta.Place;
+            vals[ColLocation] = meta.Location;
+            vals[ColX] = FormatCoord(meta.X);
+            vals[ColY] = FormatCoord(meta.Y);
+            vals[ColOrigMultilang] = isTranslated; // 原值侧复选框（只读，仅对照）
+            vals[ColOrigNoAuto] = noAutoTrans;
+            vals[ColMultilang] = isTranslated;     // 新值侧复选框（可编辑）
+            vals[ColNoAutoTrans] = noAutoTrans;
+            vals[_origTextCol] = srcVal;           // 文本列与源语言列同值（原值/新值两侧同步）
+            vals[_newTextCol] = srcVal;
+            vals[_origLangCol[_sourceLang]] = srcVal;
+            vals[_newLangCol[_sourceLang]] = srcVal;
+            foreach (var lang in _projectLangs)
+            {
+                if (lang == _sourceLang) { continue; }
+                var gv = ToGrid(isTranslated && values.TryGetValue(lang, out var x) ? x : string.Empty);
+                vals[_origLangCol[lang]] = gv;
+                vals[_newLangCol[lang]] = gv;
+            }
+
+            // 已保存基线：与旧版“建行填充后 SnapshotRow(rowIdx)”逐字段同源——
+            // 标志取两个复选框值；单语言只跟踪源语言；各语言值即新值语言格内容。
+            var snap = new RowState { Multilang = isTranslated, NoAuto = noAutoTrans };
+            foreach (var lang in _projectLangs)
+            {
+                if (!isTranslated && lang != _sourceLang) { continue; }
+                snap.V[lang] = lang == _sourceLang
+                    ? srcVal
+                    : ToGrid(values.TryGetValue(lang, out var lv) ? lv : string.Empty);
+            }
+
+            records.Add(new SortView
+            {
+                Values = vals,
+                T = t,
+                Base = snap,
+                Init = CloneRow(snap),
+                Stash = new Dictionary<ISOCode.Language, string>(),
+                Orig = i,
+                Meta = meta,
+            });
+        }
+
+        // 默认序：复用列头排序走的同一个 DefaultOrdered 比较器（结构管理顺序 高层→安装→位置 → X↑ → Y↓ → 开窗序号）。
+        // OrderBy/ThenBy 为稳定排序，故这里的顺序与旧版 ApplyDefaultOrder→ApplySort(ColIndex,0) 逐行一致。
+        var sorted = DefaultOrdered(records).ToList();
+
+        // —— P0-3 第二遍：按默认序一次性 Rows.Add 并填充，行号盖章 1..n；各并排列表按同一顺序写入。
+        //    此后显示行 i 恒对应 _texts[i]/_baseline[i]/_initial[i]/_stash[i]/_origIndex[i]/_meta[i]（SaveDirty/排序/自动保存/转到图形的下标假设不变）。——
+        _syncing = true;
+        _grid.Rows.Clear();
+        try
+        {
+            for (var i = 0; i < n; i++)
+            {
+                var v = sorted[i];
+                v.Values[ColIndex] = (i + 1).ToString(); // 默认序固定排名盖章
+                if (PerfTrace) { swPerfGrid!.Start(); } // TEMP-PERF 入表段
                 var rowIdx = _grid.Rows.Add();
                 var row = _grid.Rows[rowIdx];
-                row.Cells[ColIndex].Value = (i + 1).ToString(); // 临时值，ApplyDefaultOrder 后被固定排名覆盖
-                row.HeaderCell.Value = (i + 1).ToString();       // 行头行号
-                row.Cells[ColType].Value = typeName;
+                for (var c = 0; c < colCount; c++) { row.Cells[c].Value = v.Values[c]; }
+                row.HeaderCell.Value = (i + 1).ToString(); // 行头行号
+                // 全新行自带 RowTemplate 高度（与旧 LoadRows 加行不设高一致）；无需像 ApplySort 复用物理行那样回填 Height
+                SetRowEditable(i, Convert.ToBoolean(v.Values[ColMultilang] ?? false));
+                if (PerfTrace) { swPerfGrid!.Stop(); } // TEMP-PERF 入表段
 
-                // 只读结构/坐标信息（坐标排序用原始 double，显示保留 1 位小数）
-                if (PerfTrace) { swPerfGrid!.Stop(); swPerfRead!.Start(); } // TEMP-PERF BuildMeta 走 EPLAN 读段
-                var meta = BuildMeta(t);
-                if (PerfTrace) { swPerfRead!.Stop(); swPerfGrid!.Start(); } // TEMP-PERF BuildMeta 结束，回到入表段
-                row.Cells[ColPage].Value = meta.PageName;
-                row.Cells[ColPlant].Value = meta.Plant;
-                row.Cells[ColPlace].Value = meta.Place;
-                row.Cells[ColLocation].Value = meta.Location;
-                row.Cells[ColX].Value = FormatCoord(meta.X);
-                row.Cells[ColY].Value = FormatCoord(meta.Y);
-                _meta.Add(meta);
-
-                // 原值侧复选框：打开窗口时的状态（只读，仅对照）
-                row.Cells[ColOrigMultilang].Value = isTranslated;
-                row.Cells[ColOrigNoAuto].Value = noAutoTrans;
-                // 新值侧复选框：初始同原值，可编辑
-                row.Cells[ColMultilang].Value = isTranslated;
-                row.Cells[ColNoAutoTrans].Value = noAutoTrans;
-
-                // 源语言内容：多语言取源语言翻译，单语言取语言无关串
-                var srcVal = isTranslated
-                    ? (values.TryGetValue(_sourceLang, out var sval) ? sval : string.Empty)
-                    : mirrorVal;
-                srcVal = ToGrid(srcVal); // 真实换行 → ¶，单元格单行显示
-
-                // 文本列与源语言列同值（原值 / 新值两侧都同步）
-                row.Cells[_origTextCol].Value = srcVal;
-                row.Cells[_newTextCol].Value = srcVal;
-                row.Cells[_origLangCol[_sourceLang]].Value = srcVal;
-                row.Cells[_newLangCol[_sourceLang]].Value = srcVal;
-
-                foreach (var lang in _projectLangs)
-                {
-                    if (lang == _sourceLang) { continue; }
-                    var v = isTranslated && values.TryGetValue(lang, out var x) ? x : string.Empty;
-                    var gv = ToGrid(v);
-                    row.Cells[_origLangCol[lang]].Value = gv;
-                    row.Cells[_newLangCol[lang]].Value = gv;
-                }
-
-                SetRowEditable(rowIdx, isTranslated);
-                var snap = SnapshotRow(rowIdx);
-                _baseline.Add(snap);
-                _initial.Add(CloneRow(snap));
-                _stash.Add(new Dictionary<ISOCode.Language, string>());
-                _origIndex.Add(i);
+                _texts[i] = v.T;
+                _baseline.Add(v.Base);
+                _initial.Add(v.Init);
+                _stash.Add(v.Stash);
+                _origIndex.Add(v.Orig);
+                _meta.Add(v.Meta);
             }
         }
         finally
         {
             _syncing = false;
         }
+
+        // 等价旧“LoadRows + ApplyDefaultOrder”终态：Clear()+逐行 Add 后显式清选区/当前格，
+        // 复刻旧 ApplySort 末尾两句（Reload 时窗体已可见，避免首行被自动设为 CurrentCell）。
+        _grid.ClearSelection();
+        _grid.CurrentCell = null;
+
+        // 装载即默认序、无列头排序箭头（承接旧 ApplyDefaultOrder 对 _sortCol/_sortDir 的复位；
+        // CellPainting/AutoFitColumns 据此不画箭头、不留箭头余量）
+        _sortCol = -1;
+        _sortDir = 0;
+        // 行首宽只按总行数位数程序化设一次（O(1) GDI，旧版由随后的 ApplySort 负责，装载不再二次排序故在此设置）；
+        // 首次构造句柄未创建时 FromHwnd(Zero) 不依赖句柄，安全
+        EnsureRowHeadersWidth(n);
+
         if (PerfTrace)
         {
-            swPerfGrid!.Stop(); // TEMP-PERF 封口最后一行的赋格段（running 时读 Elapsed 本合法，Stop 仅为语义干净/两段互斥）
             swPerfLoad!.Stop(); // TEMP-PERF
-            AddInLogger.Debug("PERF LoadRows: 总=" + swPerfLoad.Elapsed.TotalMilliseconds.ToString("0.0") + "ms n=" + _texts.Count // TEMP-PERF
+            AddInLogger.Debug("PERF LoadRows: 总=" + swPerfLoad.Elapsed.TotalMilliseconds.ToString("0.0") + "ms n=" + n // TEMP-PERF
                 + " EPLAN读对象段(Contents/meta)=" + swPerfRead!.Elapsed.TotalMilliseconds.ToString("0.0") + "ms"
                 + " Rows.Add+赋格段=" + swPerfGrid!.Elapsed.TotalMilliseconds.ToString("0.0") + "ms"
                 + " BuildRankMaps=" + swPerfRank!.Elapsed.TotalMilliseconds.ToString("0.0") + "ms " + PerfCfWindowReset());
