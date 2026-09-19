@@ -1,0 +1,88 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net472</TargetFramework>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <PlatformTarget>x64</PlatformTarget>
+    <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
+
+    <!--
+      版本规则：major.minor.yyMM.DDHHb
+      - 前两段手动维护发布系列；
+      - build=yyMM，revision=DDHHb，b=floor(minute/6)，每小时 10 个 6 分钟桶；
+      - release-version.props 入库，存在于 main/tag，固化发布版本；
+      - 无 release-version.props 时（直接 dotnet/VS 或 build-controlbridge.sh）一律按当前时间现算
+        6 分钟桶动态版本；不读取磁盘 .temp 动态 props，避免跨天残留编出旧版本号。
+    -->
+    <ReleaseMajor>1</ReleaseMajor>
+    <ReleaseMinor>0</ReleaseMinor>
+    <ReleaseVersionFile>$(MSBuildProjectDirectory)\release-version.props</ReleaseVersionFile>
+    <BuildVersionRecord>$(MSBuildThisFileDirectory)..\.temp\build-version-controlbridge.json</BuildVersionRecord>
+  </PropertyGroup>
+
+  <!-- 固化模式优先：main/tag 的 release-version.props 存在即导入，重编版本恒定可复现。 -->
+  <Import Project="$(ReleaseVersionFile)" Condition="Exists('$(ReleaseVersionFile)')" />
+
+  <!-- 非固化：一律按当前时间现算 6 分钟桶动态版本（与 scripts/build-controlbridge.sh 同公式），
+       不再导入磁盘 .temp 动态 props，杜绝跨天残留版本号。
+       MSBuild 属性函数不支持参数内算术，桶位用分钟区间 Condition 映射（0..9）。 -->
+  <PropertyGroup Condition="!Exists('$(ReleaseVersionFile)')">
+    <VersionBuildPart>$([System.DateTime]::Now.ToString('yyMM'))</VersionBuildPart>
+    <DynDay>$([System.DateTime]::Now.ToString('dd'))</DynDay>
+    <DynHour>$([System.DateTime]::Now.ToString('HH'))</DynHour>
+    <DynMinute>$([System.DateTime]::Now.ToString('mm'))</DynMinute>
+    <DynBucket Condition="$(DynMinute) &lt; 6">0</DynBucket>
+    <DynBucket Condition="$(DynMinute) &gt;= 6 And $(DynMinute) &lt; 12">1</DynBucket>
+    <DynBucket Condition="$(DynMinute) &gt;= 12 And $(DynMinute) &lt; 18">2</DynBucket>
+    <DynBucket Condition="$(DynMinute) &gt;= 18 And $(DynMinute) &lt; 24">3</DynBucket>
+    <DynBucket Condition="$(DynMinute) &gt;= 24 And $(DynMinute) &lt; 30">4</DynBucket>
+    <DynBucket Condition="$(DynMinute) &gt;= 30 And $(DynMinute) &lt; 36">5</DynBucket>
+    <DynBucket Condition="$(DynMinute) &gt;= 36 And $(DynMinute) &lt; 42">6</DynBucket>
+    <DynBucket Condition="$(DynMinute) &gt;= 42 And $(DynMinute) &lt; 48">7</DynBucket>
+    <DynBucket Condition="$(DynMinute) &gt;= 48 And $(DynMinute) &lt; 54">8</DynBucket>
+    <DynBucket Condition="$(DynMinute) &gt;= 54">9</DynBucket>
+    <VersionRevisionPart>$(DynDay)$(DynHour)$(DynBucket)</VersionRevisionPart>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <AssemblyVersion>$(ReleaseMajor).$(ReleaseMinor).$(VersionBuildPart).$(VersionRevisionPart)</AssemblyVersion>
+    <FileVersion>$(AssemblyVersion)</FileVersion>
+    <InformationalVersion>v$(AssemblyVersion)</InformationalVersion>
+    <VersionMode Condition="Exists('$(ReleaseVersionFile)')">fixed</VersionMode>
+    <VersionMode Condition="!Exists('$(ReleaseVersionFile)')">dynamic</VersionMode>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Reference Include="Eplan.EplApi.AFu">
+      <HintPath>..\references\EplApi\Eplan.EplApi.AFu.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+    <Reference Include="Eplan.EplApi.Baseu">
+      <HintPath>..\references\EplApi\Eplan.EplApi.Baseu.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+    <Reference Include="Eplan.EplApi.DataModelu">
+      <HintPath>..\references\EplApi\Eplan.EplApi.DataModelu.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+    <Reference Include="Eplan.EplApi.Guiu">
+      <HintPath>..\references\EplApi\Eplan.EplApi.Guiu.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+    <Reference Include="Eplan.EplApi.HEServicesu">
+      <HintPath>..\references\EplApi\Eplan.EplApi.HEServicesu.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+  </ItemGroup>
+
+  <Target Name="WriteBuildVersionRecord" AfterTargets="Build">
+    <PropertyGroup>
+      <BuildVersionRecordDir>$([System.IO.Path]::GetDirectoryName('$(BuildVersionRecord)'))</BuildVersionRecordDir>
+      <BuildVersionGeneratedAt>$([System.DateTime]::Now.ToString('yyyy-MM-ddTHH:mm:sszzz'))</BuildVersionGeneratedAt>
+    </PropertyGroup>
+    <MakeDir Directories="$(BuildVersionRecordDir)" />
+    <WriteLinesToFile File="$(BuildVersionRecord)" Overwrite="true" Encoding="UTF-8" Lines='{"assemblyVersion":"$(AssemblyVersion)","fileVersion":"$(FileVersion)","informationalVersion":"$(InformationalVersion)","major":$(ReleaseMajor),"minor":$(ReleaseMinor),"buildPart":$(VersionBuildPart),"revisionPart":$(VersionRevisionPart),"configuration":"$(Configuration)","versionMode":"$(VersionMode)","generatedAt":"$(BuildVersionGeneratedAt)"}' />
+  </Target>
+
+</Project>
