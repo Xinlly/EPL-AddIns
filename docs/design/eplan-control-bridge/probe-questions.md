@@ -75,6 +75,24 @@
 3. 在 API Add-Ins 对话框反复"加载/卸载"探针几次，确认端口不残留、无文件锁定导致无法替换 DLL。
 - 只读/可逆。
 
+## P9. 脚本动态执行（ExecuteScript）— addendum 新增，只读/临时文件
+
+前置：官方内置 action `ExecuteScript /ScriptFile:` 已由 2.9 文档确认存在；在 add-in 内经 CommandLineInterpreter 调起的稳定性待测。
+1. 让探针（或临时受控脚本）经 `new CommandLineInterpreter(true,true).Execute(false, "ExecuteScript /ScriptFile:\"<受控目录>\\t.cs\"")` 调一个只做 `[Start]` 弹框/写临时日志的 .cs：确认**当次执行**成功。
+2. 修改该 .cs 再执行一次：确认读到的是**新内容**（执行型不驻留、可立即刷新）。
+3. 量"重复执行 5 次"的单次编译+执行耗时；连点时是否串行/报错。
+4. 试 context 形式：`Execute(false,"ExecuteScript", ctx)`（ctx 带 ScriptFile + 自定义参数）是否被接受、参数是否透传。
+- 判定：表达式 vs context 哪个稳、耗时、并发；脚本仅 Base/AFu/Gui 的限制是否与文档一致。用临时脚本，结束删临时文件，不改项目数据。
+
+## P10. 注册型脚本与 add-in 注册 API 真相 — addendum 新增
+
+1. 在 Utilities > Scripts 里 Load 一个带 `[DeclareAction]` 的脚本，确认动作注册成功并可经命令行调用；重启 EPLAN 后是否"自动再加载"（文档说会）。
+2. 能否经命令行/内置 action（CLI 里输入）**可编程** Load/Unload 该脚本，还是只能用菜单 Unload UI；若找到 action 名记录下来（**不要猜 action 名，只记录真机实测名**）。
+3. 同名脚本重复 Load：替换还是报错/重复注册。
+4. 新 add-in DLL：在 API Add-Ins 对话框勾选加载后，**当次会话**是否立即生效（不用重启）？还是必须重启？覆盖 ShadowCopy 缓存与原始 DLL（EPLAN 运行中可覆盖原文件已确认）后重启是否切到新版。
+5. 能否纯写 add-in 注册配置（不经 UI）让新 DLL 下次启动被发现；若能，注册表/配置路径与格式记录（**只读查看，不写**）。
+- 判定：DLL"安装→生效"的真实周期与是否需要 UI，决定 I7 的形态。
+
 ---
 
 ## 反馈格式（建议）

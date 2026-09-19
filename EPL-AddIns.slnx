@@ -1,4 +1,5 @@
 <Solution>
   <Project Path="EA.EplAddIn.Test/EA.EplAddIn.Test.csproj" />
   <Project Path="EA.EplAddIn.TextBatchEdit/EA.EplAddIn.TextBatchEdit.csproj" />
+  <Project Path="EA.EplAddIn.ControlBridge/EA.EplAddIn.ControlBridge.csproj" />
 </Solution>
