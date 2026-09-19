@@ -114,6 +114,7 @@ public class TextBatchEditForm : Form
     private const float ZoomMin = 0.7f, ZoomMax = 1.8f, ZoomStep = 0.1f;
 
     private const int WM_SETREDRAW = 0x000B;
+    private const int AutoSaveCadenceMs = 250; // 自动保存固定节拍：定时器常驻此间隔循环落库，输入事件只“上档”、不推迟时钟
 
     [DllImport("user32.dll")]
     private static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
@@ -623,16 +624,16 @@ public class TextBatchEditForm : Form
             {
                 tb.TextChanged -= EditingTextChanged;
                 tb.TextChanged += EditingTextChanged;
-                // P2-b：进入新格文本编辑时重置自动保存计时，防抖锚点不得还挂在前一格；
-                // 提交后由 CellEndEdit/CellValueChanged/TextChanged 重新计时。
-                _autoSaveTimer?.Stop();
+                // 进入新格编辑不停表、不重置节拍（固定节拍循环跨格导航持续运行，否则快速连读会把定时器饿死）；
+                // 正在编辑的这一行由 Tick 按行排除（skipRow）保护：不写、不 EndEdit、不刷新，上一格等静止脏行照常落库。
                 // 编辑态承载焦点的是内嵌文本框，默认用系统菜单（没有我们的“换行/转到图形”）；
                 // 显式挂专用菜单，保证编辑中右键也能插入 ¶、转到图形。
                 tb.ContextMenuStrip = BuildEditMenu(tb);
             }
         };
-        // 编辑结束（含 Esc 取消这类不触发 CellValueChanged 的路径）重新排一次，
-        // 闭合 EditingControlShowing 停表后“再也不保存”的可能。
+        // 某格结束编辑（含 Esc 取消这类不触发 CellValueChanged 的路径）只“上档”固定节拍定时器，不推迟时钟；
+        // 已在跑时本调用什么都不做（无 Stop/Start 重置），保证快速连读时刚提交的行在最近一个 250ms tick 落库；
+        // Tick 到点时会把“当前仍在编辑的另一行”按行排除。
         _grid.CellEndEdit += (_, _) => ScheduleAutoSave();
         _grid.DataError += (_, e) =>
         {
@@ -1967,7 +1968,7 @@ public class TextBatchEditForm : Form
         _statusLabel.ForeColor = baseColor;
     }
 
-    /// <summary>开关“自动保存”：开启时把当前未保存内容安排一次写回；始终刷新状态。</summary>
+    /// <summary>开关“自动保存”：开启时上档固定节拍定时器（当前未保存内容会在最近一个 250ms tick 落库）；始终刷新状态。</summary>
     private void OnAutoSaveToggled()
     {
         var on = _autoSaveChk.Checked;
@@ -1977,45 +1978,73 @@ public class TextBatchEditForm : Form
     }
 
     /// <summary>当前格正处于文本编辑（承载焦点的 TextBoxBase 编辑控件已就位）。
-    /// 自动保存遇到此状态本轮跳过：既不保存也不 EndEdit，避免打断用户正在编辑的格子。</summary>
+    /// 自动保存时该格所在行按行排除：不写、不 EndEdit、不刷新，但其他静止脏行照常落库。</summary>
     private bool IsCurrentTextCellEditing() =>
         _grid.IsCurrentCellInEditMode
         && _grid.EditingControl is TextBoxBase tb
         && tb.Focused;
 
+    /// <summary>只“上档”固定节拍定时器：保证 250ms 循环在跑，绝不重置已有时钟（输入事件只上档、不推迟）。
+    /// 已在跑时什么都不做；定时器为空则新建并启动。休眠/失败停表逻辑全部内聚在 Tick 中。</summary>
     private void ScheduleAutoSave()
     {
         if (_saving || _autoSaveChk == null || !_autoSaveChk.Checked) { return; }
         if (IsDisposed) { return; }
         if (_autoSaveTimer == null)
         {
-            _autoSaveTimer = new System.Windows.Forms.Timer { Interval = 600 };
+            _autoSaveTimer = new System.Windows.Forms.Timer { Interval = AutoSaveCadenceMs };
             _autoSaveTimer.Tick += (_, _) =>
             {
-                _autoSaveTimer.Stop();
-                if (IsDisposed || _saving || _autoSaveChk == null || !_autoSaveChk.Checked) { return; }
-                // P2-b 守卫：当前格仍在文本编辑时本轮不保存、不 EndEdit，重启防抖稍后重试；
-                // 用户提交该格后由 CellEndEdit/CellValueChanged/TextChanged 自然再调度，保证脏数据最终落库。
-                if (IsCurrentTextCellEditing())
+                // 常驻节拍：Tick 开头不 Stop()，任何输入事件都不能推迟这个时钟（修复快速连读饿死）。
+                if (IsDisposed || _saving || _autoSaveChk == null || !_autoSaveChk.Checked)
                 {
-                    _autoSaveTimer.Start();
+                    _autoSaveTimer.Stop();
                     return;
                 }
-                if (DirtyRows().Count == 0) { return; }
+                // 正在文本编辑的那一行本轮整行排除（不写、不 EndEdit、不回读、不刷新）；
+                // 其他已静止的脏行照常落库，不因当前格在编辑而整轮跳过。
+                int? editRow = null;
+                if (IsCurrentTextCellEditing())
+                {
+                    var er = _grid.CurrentCell?.RowIndex ?? -1;
+                    if (er >= 0) { editRow = er; }
+                }
+                var dirty = DirtyRows();
+                if (editRow.HasValue) { dirty = dirty.Where(r => r != editRow.Value).ToList(); }
+                if (dirty.Count == 0)
+                {
+                    // 无静止脏行：进入休眠、不空扫；靠下一次 CellEndEdit/CellValueChanged/开关切换重新上档。
+                    _autoSaveTimer.Stop();
+                    return;
+                }
                 _saving = true;
+                var ok = false;
                 try
                 {
-                    AddInLogger.Debug("自动保存触发");
-                    SaveDirty(quietSuccess: true, commitCurrentEdit: false);
+                    AddInLogger.Debug("自动保存触发" + (editRow.HasValue ? "（跳过编辑中行" + (editRow.Value + 1) + "）" : string.Empty));
+                    ok = SaveDirty(quietSuccess: true, commitCurrentEdit: false, skipRow: editRow, background: true);
                 }
                 finally
                 {
                     _saving = false;
                 }
+                if (!ok)
+                {
+                    // 失败（回读不一致/异常）：停表防忙循环（避免每 250ms 重写同一批失败行）；
+                    // 等下次 CellEndEdit/CellValueChanged/手动应用重新上档。background 已只记日志、不弹窗。
+                    _autoSaveTimer.Stop();
+                    return;
+                }
+                // 成功：不停表、不重启，保持 250ms 固定节拍继续循环；下一拍无脏行时自然休眠。
+                if (!_grid.IsCurrentCellInEditMode)
+                {
+                    // 本轮确实没有编辑中的格：刷新一次状态/底色（Invalidate 不夺焦、不打回编辑态）；编辑中不刷 UI。
+                    UpdateApplyEnabled();
+                }
             };
         }
-        _autoSaveTimer.Stop();
-        _autoSaveTimer.Start(); // 600ms 防抖：连续编辑合并为一次写回/一个撤销点
+        // 固定节拍：已在跑时什么都不做（删掉旧的无条件 Stop()+Start()，那正是连读时被反复清零饿死的根因）。
+        if (!_autoSaveTimer.Enabled) { _autoSaveTimer.Start(); }
     }
 
     private void DisposeAutoSaveTimer()
@@ -2026,7 +2055,8 @@ public class TextBatchEditForm : Form
     private void EditingTextChanged(object? sender, EventArgs e)
     {
         if (_applyBtn is { Enabled: false }) { _applyBtn.Enabled = true; }
-        ScheduleAutoSave(); // 编辑中每键仅重置防抖；到点时若仍在编辑，Tick 守卫会跳过本轮而不打断输入
+        // 每键不再重置防抖：否则在 B 格打字会不断推后对 A 等静止脏行的落库（防抖饿死）。
+        // 正在编辑的行由 Tick 按行跳过保护，待 CellEndEdit 时统一 ScheduleAutoSave。
     }
 
     /// <summary>
@@ -2466,8 +2496,11 @@ public class TextBatchEditForm : Form
     /// </summary>
     /// <param name="commitCurrentEdit">true（默认，手动“应用/确定”、刷新选择集等显式路径）先提交当前编辑格，保证“最后一格未离开也能保存”；
     /// false（仅自动保存）：不 EndEdit 当前格，调用方已先做编辑态守卫，只写已提交的脏行。</param>
+    /// <param name="skipRow">非 null 时（仅自动保存）整行排除该脏行：不写、不回读、不刷新基线、不计入日志，用于保护用户正在编辑的那一行。</param>
+    /// <param name="background">true（仅自动保存 Tick）：回读不一致/异常只记日志不弹窗（避免夺焦），末尾不调用含 Invalidate 的 UpdateApplyEnabled（避免打断编辑）；
+    /// false（应用/确定/关窗/手动）行为完全不变，仍弹窗、仍 Invalidate。</param>
     /// <returns>true=可关窗（无修改或写回并校验一致）；false=异常或回读不一致，保留窗口。</returns>
-    private bool SaveDirty(bool quietSuccess = false, bool commitCurrentEdit = true)
+    private bool SaveDirty(bool quietSuccess = false, bool commitCurrentEdit = true, int? skipRow = null, bool background = false)
     {
         var swPerfSave = PerfTrace ? Stopwatch.StartNew() : null;   // TEMP-PERF 保存总计
         var swPerfCommit = PerfTrace ? Stopwatch.StartNew() : null; // TEMP-PERF 段1 提交当前格（不含 EndEdit 时仅一帧，结合编辑态标志解读）
@@ -2480,6 +2513,7 @@ public class TextBatchEditForm : Form
         if (PerfTrace) { swPerfCommit!.Stop(); } // TEMP-PERF
 
         var dirty = DirtyRows();
+        if (skipRow.HasValue) { dirty = dirty.Where(r => r != skipRow.Value).ToList(); }
         if (dirty.Count == 0)
         {
             if (PerfTrace) // TEMP-PERF 无脏行早退汇总（未开事务，段2/段3为 0）
@@ -2639,22 +2673,27 @@ public class TextBatchEditForm : Form
             if (mismatchRows.Count > 0)
             {
                 AddInLogger.Error("SaveDirty: 回读不一致行=[" + string.Join(",", mismatchRows) + "]");
-                MessageBox.Show("写回存在回读不一致的行：" + string.Join(",", mismatchRows.Take(30))
-                    + "。\n请查看日志，未将这些行标记为已保存。", "文本批量编辑",
-                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                // 后台自动保存（background）只记日志，不弹窗夺焦、不 Invalidate；前台路径保持原弹窗行为。
+                if (!background)
+                {
+                    MessageBox.Show("写回存在回读不一致的行：" + string.Join(",", mismatchRows.Take(30))
+                        + "。\n请查看日志，未将这些行标记为已保存。", "文本批量编辑",
+                        MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                }
                 // 仅把校验通过的脏行更新为已保存基线；失败行保留脏状态，可修正后再次应用
                 foreach (var i in dirty)
                 {
                     if (!mismatchRows.Contains(i + 1)) { _baseline[i] = SnapshotRow(i); }
                 }
-                UpdateApplyEnabled();
+                if (!background) { UpdateApplyEnabled(); }
                 if (PerfTrace) { PerfLogDirtySave(); } // TEMP-PERF 回读不一致路径
                 return false;
             }
 
             // 全部成功：刷新基线（原值列保留为开窗时的原值，作为本会话对照）
             foreach (var i in dirty) { _baseline[i] = SnapshotRow(i); }
-            UpdateApplyEnabled();
+            // 后台自动保存不在这里 Invalidate：editRow 仍在编辑时刷新会打断输入；由 Tick 在无编辑行时补一次。
+            if (!background) { UpdateApplyEnabled(); }
 
             AddInLogger.Info("SaveDirty: 成功 写回行=[" + string.Join(",", written) + "]，合并为 1 个撤销点");
             if (PerfTrace) { PerfLogDirtySave(); } // TEMP-PERF 成功路径
@@ -2670,8 +2709,12 @@ public class TextBatchEditForm : Form
             if (PerfTrace) { PerfLogDirtySave(); } // TEMP-PERF 异常路径（段2可能仍在计时，Elapsed 反映到异常点；原异常继续抛出/处理路径不变）
             AddInLogger.Error("SaveDirty 异常，尝试中止事务", ex);
             try { txn?.Abort(); } catch (Exception abortEx) { AddInLogger.Error("事务 Abort 失败", abortEx); }
-            MessageBox.Show("写回失败：" + ex.Message, "文本批量编辑",
-                MessageBoxButtons.OK, MessageBoxIcon.Error);
+            // 后台自动保存（background）只记日志不弹窗，避免在用户编辑另一格时 MessageBox 夺焦；前台路径保持原行为。
+            if (!background)
+            {
+                MessageBox.Show("写回失败：" + ex.Message, "文本批量编辑",
+                    MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
             return false;
         }
         finally
