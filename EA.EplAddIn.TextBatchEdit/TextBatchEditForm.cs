@@ -126,9 +126,10 @@ public class TextBatchEditForm : Form
     }
 
     /// <summary>
-    /// 行首宽按总行数【位数】程序化设一次固定宽（替代 AutoSizeToAllHeaders 的全量行首 GDI 测量）：
+    /// 行首宽按总行数【位数】给出不截断的最小足宽（替代 AutoSizeToAllHeaders 的全量行首 GDI 测量）：
     /// 只对最长行号串（n 的位数）做一次 TextRenderer.MeasureText（O(1)，与行数无关），加行首内边距与
-    /// 当前行指示箭头留白，保证 10000 行时“10000”不被截。调用前置为 DisableResizing（见 BuildGrid）。
+    /// 当前行指示箭头留白，保证 10000 行时“10000”不被截。仅在所需宽度更大时加宽（max，只增不减），
+    /// 不缩小用户在左上角表头单元格右缘手动拖出的宽度；位数显著增多（初次/大选择集）或放大字体时自动加宽。
     /// </summary>
     private void EnsureRowHeadersWidth(int n)
     {
@@ -140,7 +141,9 @@ public class TextBatchEditForm : Form
             TextFormatFlags.SingleLine | TextFormatFlags.NoPadding).Width;
         // 行首左右内边距 + 右侧当前行指示箭头留白（AutoSize 结果同样含此项），随 DPI 缩放
         var pad = (int)Math.Ceiling(16.0 * g.DpiY / 96.0);
-        _grid.RowHeadersWidth = w + pad;
+        // 只增不减：排序/装载在位数不增时不踩回用户手调宽度
+        var required = w + pad;
+        if (required > _grid.RowHeadersWidth) { _grid.RowHeadersWidth = required; }
     }
 
     /// <summary>Ctrl+滚轮：以光标为中心整体缩放表格字体、列宽、行高（行号列宽随字体自适应）。</summary>
@@ -179,6 +182,8 @@ public class TextBatchEditForm : Form
             _zoom = newZoom;
             // 固定行首宽不随字体自动重算（旧 AllHeaders 模式会自动跟随）：缩放字体后按位数重设，避免大字号截字
             EnsureRowHeadersWidth(_grid.Rows.Count);
+            // EnableResizing 后列头行高不再自动跟随字体：与数据行高同语义同比缩放，避免放大时双行标题被截
+            _grid.ColumnHeadersHeight = Math.Max(20, (int)Math.Round(_grid.ColumnHeadersHeight * ratio));
         }
         finally
         {
@@ -245,6 +250,7 @@ public class TextBatchEditForm : Form
     }
 
     private bool _syncing; // 程序化填充/双向同步时抑制事件联动
+    private bool _columnHeadersHeightInitialized; // 列头行高仅在首次 Shown 列宽定稿后自适应一次，之后不踩用户手调高度
 
     public TextBatchEditForm(List<TextBase> texts,
         ISOCode.Language sourceLang, List<ISOCode.Language> projectLangs, Project? project = null)
@@ -274,8 +280,17 @@ public class TextBatchEditForm : Form
         Application.AddMessageFilter(_clipFilter);
         _ctrlJFilter = new CtrlJFilter(this);
         Application.AddMessageFilter(_ctrlJFilter);
-        // 窗体真正显示（grid 句柄已建）后：按两个开关初始化列可见性（内含一次自动列宽）
-        Shown += (_, _) => UpdateColumnVisibility();
+        // 窗体真正显示（grid 句柄已建）后：按两个开关初始化列可见性（内含一次自动列宽）；
+        // 列宽定稿后仅首次做一次列头行高自适应，锁定双行标题默认高度（EnableResizing 后不再自动跟随）
+        Shown += (_, _) =>
+        {
+            UpdateColumnVisibility();
+            if (!_columnHeadersHeightInitialized)
+            {
+                _columnHeadersHeightInitialized = true;
+                _grid.AutoResizeColumnHeadersHeight();
+            }
+        };
     }
 
     protected override void OnFormClosing(FormClosingEventArgs e)
@@ -445,8 +460,8 @@ public class TextBatchEditForm : Form
             MultiSelect = true,
             RowHeadersVisible = true,   // 最左行首列：显示行号，兼作行选择/拖拽行高
             // 行首宽不用 AutoSizeToAllHeaders（增删行/排序时对全部行首做 GDI 测量）：
-            // 改由 EnsureRowHeadersWidth 按总行数位数程序化设定固定宽（O(1)）；DisableResizing 同样禁止用户拖拽改宽，行高拖拽仍走内置分隔条
-            RowHeadersWidthSizeMode = DataGridViewRowHeadersWidthSizeMode.DisableResizing,
+            // 初值由 EnsureRowHeadersWidth 按总行数位数给足（O(1)，只增不减）；EnableResizing 允许用户拖拽左上角表头单元格右缘改宽，行高拖拽仍走内置分隔条
+            RowHeadersWidthSizeMode = DataGridViewRowHeadersWidthSizeMode.EnableResizing,
             AllowUserToResizeRows = true,    // 内置行高拖拽分隔条只出现在行号（行首）列底边，数据列不可拖
             BackgroundColor = System.Drawing.Color.White,
             ClipboardCopyMode = DataGridViewClipboardCopyMode.EnableWithoutHeaderText,
@@ -454,7 +469,7 @@ public class TextBatchEditForm : Form
             ShowCellToolTips = true,
             DefaultCellStyle = new DataGridViewCellStyle { WrapMode = DataGridViewTriState.False },
             EnableHeadersVisualStyles = false, // 允许自定义表头底色
-            ColumnHeadersHeightSizeMode = DataGridViewColumnHeadersHeightSizeMode.AutoSize, // 适配双行标题
+            ColumnHeadersHeightSizeMode = DataGridViewColumnHeadersHeightSizeMode.EnableResizing, // 允许用户拖列头下缘改行高；默认双行高度在首次 Shown 列宽定稿后由 AutoResizeColumnHeadersHeight 一次性锁定
             GridColor = System.Drawing.Color.FromArgb(170, 170, 170), // 加深网格线，表头/数据行分界更清晰
             // 行首列（行号列）底色与列标题一致、无列标题；数字居中，选中箭头仍显示在最右
             RowHeadersDefaultCellStyle = new DataGridViewCellStyle
