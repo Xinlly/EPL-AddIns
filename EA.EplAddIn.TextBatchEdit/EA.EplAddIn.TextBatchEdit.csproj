@@ -13,23 +13,37 @@
       - 前两段手动维护发布系列；
       - build=yyMM，revision=DDHHb，b=floor(minute/6)，每小时 10 个 6 分钟桶；
       - release-version.props 入库，存在于 main/tag，固化发布版本；
-      - .temp/TextBatchEdit.DynamicVersion.props 不入库，由 scripts/build.sh 在构建前生成。
+      - 无 release-version.props 时（直接 dotnet/VS 或 build.sh）一律按当前时间现算
+        6 分钟桶动态版本；不读取磁盘 .temp 动态 props，避免跨天残留编出旧版本号。
     -->
     <ReleaseMajor>1</ReleaseMajor>
     <ReleaseMinor>0</ReleaseMinor>
     <ReleaseVersionFile>$(MSBuildProjectDirectory)\release-version.props</ReleaseVersionFile>
-    <DynamicVersionFile>$(MSBuildThisFileDirectory)..\.temp\TextBatchEdit.DynamicVersion.props</DynamicVersionFile>
     <BuildVersionRecord>$(MSBuildThisFileDirectory)..\.temp\build-version.json</BuildVersionRecord>
   </PropertyGroup>
 
-  <!-- 固化模式优先；其次导入 build.sh 刚生成的动态版本（6 分钟粒度）。 -->
+  <!-- 固化模式优先：main/tag 的 release-version.props 存在即导入，重编版本恒定可复现。 -->
   <Import Project="$(ReleaseVersionFile)" Condition="Exists('$(ReleaseVersionFile)')" />
-  <Import Project="$(DynamicVersionFile)" Condition="!Exists('$(ReleaseVersionFile)') And Exists('$(DynamicVersionFile)')" />
 
-  <!-- 兜底：直接用 dotnet/VS 编译且没有版本文件时，按小时粒度动态，保证可编译且不过期。 -->
-  <PropertyGroup Condition="!Exists('$(ReleaseVersionFile)') And !Exists('$(DynamicVersionFile)')">
+  <!-- 非固化：一律按当前时间现算 6 分钟桶动态版本（与 scripts/build.sh 同公式），
+       不再导入磁盘 .temp 动态 props，杜绝跨天残留版本号。
+       MSBuild 属性函数不支持参数内算术，桶位用分钟区间 Condition 映射（0..9）。 -->
+  <PropertyGroup Condition="!Exists('$(ReleaseVersionFile)')">
     <VersionBuildPart>$([System.DateTime]::Now.ToString('yyMM'))</VersionBuildPart>
-    <VersionRevisionPart>$([System.DateTime]::Now.ToString('ddHH'))</VersionRevisionPart>
+    <DynDay>$([System.DateTime]::Now.ToString('dd'))</DynDay>
+    <DynHour>$([System.DateTime]::Now.ToString('HH'))</DynHour>
+    <DynMinute>$([System.DateTime]::Now.ToString('mm'))</DynMinute>
+    <DynBucket Condition="$(DynMinute) &lt; 6">0</DynBucket>
+    <DynBucket Condition="$(DynMinute) &gt;= 6 And $(DynMinute) &lt; 12">1</DynBucket>
+    <DynBucket Condition="$(DynMinute) &gt;= 12 And $(DynMinute) &lt; 18">2</DynBucket>
+    <DynBucket Condition="$(DynMinute) &gt;= 18 And $(DynMinute) &lt; 24">3</DynBucket>
+    <DynBucket Condition="$(DynMinute) &gt;= 24 And $(DynMinute) &lt; 30">4</DynBucket>
+    <DynBucket Condition="$(DynMinute) &gt;= 30 And $(DynMinute) &lt; 36">5</DynBucket>
+    <DynBucket Condition="$(DynMinute) &gt;= 36 And $(DynMinute) &lt; 42">6</DynBucket>
+    <DynBucket Condition="$(DynMinute) &gt;= 42 And $(DynMinute) &lt; 48">7</DynBucket>
+    <DynBucket Condition="$(DynMinute) &gt;= 48 And $(DynMinute) &lt; 54">8</DynBucket>
+    <DynBucket Condition="$(DynMinute) &gt;= 54">9</DynBucket>
+    <VersionRevisionPart>$(DynDay)$(DynHour)$(DynBucket)</VersionRevisionPart>
   </PropertyGroup>
 
   <PropertyGroup>
@@ -37,8 +51,7 @@
     <FileVersion>$(AssemblyVersion)</FileVersion>
     <InformationalVersion>v$(AssemblyVersion)</InformationalVersion>
     <VersionMode Condition="Exists('$(ReleaseVersionFile)')">fixed</VersionMode>
-    <VersionMode Condition="!Exists('$(ReleaseVersionFile)') And Exists('$(DynamicVersionFile)')">dynamic</VersionMode>
-    <VersionMode Condition="!Exists('$(ReleaseVersionFile)') And !Exists('$(DynamicVersionFile)')">dynamic-hour-fallback</VersionMode>
+    <VersionMode Condition="!Exists('$(ReleaseVersionFile)')">dynamic</VersionMode>
   </PropertyGroup>
 
   <ItemGroup>

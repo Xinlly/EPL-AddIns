@@ -68,9 +68,10 @@ dotnet build EPL-AddIns.slnx
 
 - **Git tag / AssemblyVersion / FileVersion / InformationalVersion 四者一致**：tag 带 `v`（`v1.0.2609.13202`），三个 .NET 字段用纯数字（`1.0.2609.13202`），InformationalVersion 带 `v`。
 - **develop 动态 / main 固化（可复现）**：
-  - develop（日常测试）：`./scripts/build.sh` 用 bash `date` 按北京时间计算并写不入库的 `.temp/TextBatchEdit.DynamicVersion.props`（6 分钟粒度），版本随构建变，便于识别 ShadowCopy 旧 DLL。
+  - 非固化（develop / 日常测试，无 `release-version.props`）：csproj 一律在编译时按当前时间（北京时间）现算 6 分钟桶动态版本，`./scripts/build.sh`、直接 `dotnet build`、VS 三路结果一致，版本随构建变，便于识别 ShadowCopy 旧 DLL。
+  - `.temp/TextBatchEdit.DynamicVersion.props` 不入库，仅由 `./scripts/build.sh` 写出作为本次构建的可追溯记录，**csproj 不再导入它**（磁盘残留不影响版本号）。
   - main / tag（正式发布）：入库的 `EA.EplAddIn.TextBatchEdit/release-version.props` 提供固定 `VersionBuildPart`/`VersionRevisionPart`，checkout 同一 tag 重编版本号不变。
-  - 直接用 `dotnet`/VS 编译且两种 props 都不存在时，csproj 兜底按小时粒度 `ddHH` 动态（mode=`dynamic-hour-fallback`），保证可编译。
+  - 版本模式 mode 只有 `fixed`（有固化 props）与 `dynamic`（非固化现算）两种。
   - 每次构建后写 `.temp/build-version.json`（含三字段版本、buildPart/revisionPart、mode、生成时间），`.temp/` 已 gitignore。
 - 发布用 `./scripts/release-from-develop.sh [--dry-run|--no-push]`：develop 构建→读 build-version.json→merge 到 main→固化 release-version.props→Release 编译→读真实 DLL 三字段逐项校验→提交→打 annotated tag→推送。
 - 版本在**编译时**写入 DLL，重启 EPLAN 不变——不要用运行时 `DateTime.Now` 做构建标识（每次启动都变，无意义）。
